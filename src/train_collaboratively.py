@@ -198,7 +198,12 @@ if __name__ == "__main__":
     # run to test, forces set to zero in observation space
     base_log_dir = "runs_11_nov_test"
     model_name = "11_nov_test"
-    run_subdir = "20251111-212814_11_nov_test"
+    run_subdir = "20251111-220821_11_nov_test"
+
+    # run to test, forces included!
+    # base_log_dir = "runs_11_nov_test"
+    # model_name = "11_nov_test"
+    # run_subdir = "20251111-212814_11_nov_test"
 
     # run to test, forces set in observation space
 
