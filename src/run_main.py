@@ -172,10 +172,18 @@ def run_trained_model_conditional_reset(
 # ============================================================
 
 if __name__ == "__main__":
+    # no force in obs
+    # base_log_dir = "runs_11_nov_test"
+    # model_name = "11_nov_test"
+    # run_subdir = "20251111-220821_11_nov_test"
 
-    base_log_dir = "runs_11_nov_test"
-    model_name = "11_nov_test"
-    run_subdir = "20251111-220821_11_nov_test"
+    # force in obs
+    base_log_dir = "runs/offline/runs_13_nov_test"
+    model_name = "13_nov_test"
+    run_subdir = "20251113-161901_13_nov_test"
+
+
+
     start_goal = (0.0, 2.0)
 
     print(f"Running trained SAC policy from: {run_subdir}")

@@ -234,13 +234,30 @@ class AlbertTableEnv(gym.Env):
         whp = 3.5
         heading_penalty = - (whp * heading_error_bi) ** 2
 
+        # =============================================================
+        # Force–Velocity Alignment Reward (NEW)
+        # =============================================================
+        Fh_xy = self.sim.last_Fh_xy
+        tv_xy = self.sim.get_table_state_world()[2]
+
+        norm_Fh = np.linalg.norm(Fh_xy) + 1e-6
+        norm_tv = np.linalg.norm(tv_xy) + 1e-6
+        cosine_alignment = np.dot(Fh_xy, tv_xy) / (norm_Fh * norm_tv)
+
+        # Optional scaling to keep it small relative to other rewards
+        lambda_fv = 4.0
+        fv_reward = lambda_fv * cosine_alignment
+
+
         # final reward
         total_reward = (
             progress_reward +
             motion_reward +
             distance_penalty +
-            heading_penalty
+            heading_penalty + fv_reward
         )
+        # if self.step_count % 50 == 0: 
+        #     print(f"progress reward {progress_reward}, motion reward {motion_reward}, distance_penalty: {distance_penalty}, heading_penalty: {heading_penalty}, fv_reward: {fv_reward}")
 
         return total_reward, progress_reward, distance_penalty, heading_penalty
 
@@ -320,6 +337,9 @@ class AlbertTableEnv(gym.Env):
         ob = self.sim.env.step(full)           # physics step for mobile base
         self._last_env_ob = ob
 
+        # 🔴 NEW: force the arm back to its rigid pose after physics integration
+        self.sim.enforce_rigid_arm()
+
         # -------------------------------------------------------
         # 5) GOAL DISTANCE + REWARD
         # -------------------------------------------------------
@@ -367,6 +387,7 @@ class AlbertTableEnv(gym.Env):
             "human_action": self.sim.human_action,
         }
 
+
         return self._get_obs(), reward, terminated, truncated, info
 
 
@@ -375,88 +396,116 @@ class AlbertTableEnv(gym.Env):
     #                                RESET
     # ---------------------------------------------------------------------
     def reset(self, *, seed=None, options=None, Fh_override=None):
-
-        """
-        Full environment reset with:
-
-            - URDFenv reconstruction
-            - robot ID lookup
-            - table reload
-            - human controller setup
-            - initial impedance step
-            - initial distance computation
-
-        Logic is exactly preserved from your monolithic script.
-        """
-
         super().reset(seed=seed)
         self._external_force_active = Fh_override is not None
-
-
         self.step_count = 0
 
-        # sample a goal
+        # ---------------------------------------------------
+        # 0) Sample goal
+        # ---------------------------------------------------
         self.goal = self.goals[np.random.randint(len(self.goals))]
         print(f"Goal is: {self.goal}")
 
-        # --------------------------------------------------------
-        # 1) Initialize or reset URDFenv
-        # --------------------------------------------------------
-        if getattr(self.sim, "env", None) is None:
-            # !!! FIRST EVER INITIALIZATION
+        # ===================================================
+        # FIRST-EVER EPISODE
+        # ===================================================
+        if self.sim.env is None:
+            print("=== FIRST EPISODE: full initialization ===")
+
+            # 1) Build URDFenv (spawns robot)
             ob0 = self.sim.create_environment()
+
+            # 2) Find robot ID
+            self.sim.albert_id = self.sim.get_albert_body_id()
+
+            # 3) Load the table ONCE
+            self.sim.load_table()
+
+            # 4) URDFenv settle BEFORE touching arm
+            zero = np.zeros(self.sim.env.n())
+            self.sim.env.step(zero)
+
+            # 5) Set arm pose (correct frames)
+            self.sim.set_arm_initial_pose()
+            #self.sim.disable_arm_motors()
+
+            # 6) Save observation (list-format)
+            self._last_env_ob = ob0 
+
+        # ===================================================
+        # SUBSEQUENT EPISODES
+        # ===================================================
         else:
-            # !!! SUBSEQUENT EPISODE RESET
-            ob0 = self.sim.env.reset(pos=np.zeros(10))
+            print("=== LATER EPISODE: reset positions ===")
 
-        self._last_env_ob = ob0
+            # -----------------------------
+            # Reset robot base
+            # -----------------------------
+            
+            p.resetBasePositionAndOrientation(
+                self.sim.albert_id,
+                [0.0, 0.0, 0.2],
+                p.getQuaternionFromEuler([0,0,0])
+            )
+            p.resetBaseVelocity(self.sim.albert_id, [0,0,0],[0,0,0])
 
-        # --------------------------------------------------------
-        # 2) Get robot PyBullet body ID
-        # --------------------------------------------------------
-        self.sim.albert_id = self.sim.get_albert_body_id()
 
-        # --------------------------------------------------------
-        # 3) Remove old table instance (PyBullet level)
-        # --------------------------------------------------------
-        if self.sim.table_id is not None:
-            try:
-                p.removeBody(self.sim.table_id)
-            except Exception:
-                pass
+            # Reset wheels
+            for wheel_joint in ["wheel_left_joint", "wheel_right_joint"]:
+                jid = self.sim.get_joint_id_by_name(self.sim.albert_id, wheel_joint)
+                p.resetJointState(self.sim.albert_id, jid, 0.0, 0.0)
 
-        self.sim.table_id = None
 
-        # --------------------------------------------------------
-        # 4) Load new table + handles + human controller
-        # --------------------------------------------------------
-        self.sim.load_table()
+          
+            
 
-        # --------------------------------------------------------
-        # 5) Set robot arm initial pose + disable arm motors
-        # --------------------------------------------------------
-        self.sim.set_arm_initial_pose()
-        self.sim.disable_arm_motors()
+            # -----------------------------
+            # Reset table base
+            # -----------------------------
+            self.sim.reset_table()   # SAFE: table_id guaranteed to exist
+         
 
-        # --------------------------------------------------------
-        # 6) Do one initial impedance step to settle pose
-        # --------------------------------------------------------
-        robot_xy = np.zeros(2)
+
+
+            # # -----------------------------
+            # # Resolve any collisions
+            # # -----------------------------
+            # for _ in range(5):
+            #     p.stepSimulation()
+
+            # -----------------------------
+            # Fresh URDFenv observation
+            # -----------------------------
+            raw = self.sim.env._get_ob()
+            self._last_env_ob = [raw]
+
+        # ===================================================
+        # COMMON SETTLE STEPS FOR BOTH CASES
+        # ===================================================
+
+        # Impedance settle step
+        base_state = self._last_env_ob[0]["robot_0"]["joint_state"]
+        robot_xy = np.array(base_state["position"][:2])
         self.sim.impedance_step(self.goal, robot_xy)
 
-        # --------------------------------------------------------
-        # 7) Let URDFenv run one step to stabilize robot base
-        # --------------------------------------------------------
-        zero = np.zeros(self.sim.env.n(), dtype=float)
+        # URDFenv settle
+        zero = np.zeros(self.sim.env.n())
         self._last_env_ob = self.sim.env.step(zero)
 
-        # --------------------------------------------------------
-        # 8) Set initial distance for reward progress
-        # --------------------------------------------------------
+        # Initialize previous distance
         table_xy, _, _, _ = self.sim.get_table_state_world()
         self.prev_dist = float(np.linalg.norm(self.goal - table_xy))
 
+        # Allow everything to settle 
+        print("allow everything to settle")
+        for _ in range(100):
+            p.stepSimulation()
+            time.sleep(0.01)
+
         return self._get_obs(), {}
+
+
+
 
 
     # ---------------------------------------------------------------------
@@ -490,3 +539,13 @@ class AlbertTableEnv(gym.Env):
         """Close URDFenv"""
         self.sim.env.close()
         print("Environment closed.")
+
+
+    def _debug_arm(self):
+        joints = [p.getJointState(self.sim.albert_id, j)[0] for j in self.sim.arm_joint_indices]
+
+        print(f"\n==== arm pose at step: {self.step_count} ====")
+        print("Joint angles:", np.round(joints, 3))
+
+
+
