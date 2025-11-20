@@ -178,9 +178,9 @@ if __name__ == "__main__":
     # run_subdir = "20251111-220821_11_nov_test"
 
     # force in obs
-    base_log_dir = "runs/offline/runs_13_nov_test"
-    model_name = "13_nov_test"
-    run_subdir = "20251113-161901_13_nov_test"
+    base_log_dir = "runs/offline/runs_19_nov_test"
+    model_name = "19_nov_test"
+    run_subdir = "20251119-115051_19_nov_test"
 
 
 

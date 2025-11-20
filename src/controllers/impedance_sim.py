@@ -79,10 +79,11 @@ class AlbertTableImpedanceSim:
         self.arm_joint_indices = [7, 8, 9, 10, 11, 12, 13]
         self.ee_idx = 16   # end-effector link index
 
-        # Impedance model parameters (identical to original)
+        # Impedance model parameters (identical to original) Albert ORIGINAL tuned
         self.Kp = np.diag([300.0, 300.0, 0.0])   # translational stiffness
         self.Dp = np.diag([60.0, 60.0, 0.0])     # translational damping
-        self.F_max = np.array([70.0, 70.0, 70.0]) # translational saturation
+        self.F_max = np.array([40.0, 40.0, 40.0]) # translational saturation
+
         self.tau_max = 25.0                      # max joint torque
 
         # Simulation entity handles (set later)
@@ -162,6 +163,12 @@ class AlbertTableImpedanceSim:
 
         # !!! Here the global URDF environment is created
         self.env = UrdfEnv(dt=self.dt, robots=[robot], render=self.render)
+
+        # -----------------------------------------------------------------------
+        # ✅ NEW: DISABLE SHADOWS FOR PERFORMANCE/AESTHETICS 
+        # -----------------------------------------------------------------------
+        if self.render:
+            p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0) # Disables shadows
 
         
 
@@ -265,7 +272,6 @@ class AlbertTableImpedanceSim:
             p.stepSimulation()
             time.sleep(0.01)
 
-
     # -----------------------------------------------------------------------
     #              ROBOT ARM SETUP (INITIAL POSE, PASSIVE MODE)
     # -----------------------------------------------------------------------
@@ -345,13 +351,13 @@ class AlbertTableImpedanceSim:
             - robot end-effector (EE)
             - table handle link
 
-        Computes:
-            - EE <-> handle translational interaction force (Fr)
-            - EE <-> handle yaw torque
-            - Jᵀ wrench projection into arm joint torques
+        FIXED VERSION:
+        --------------
+        Prevents the virtual impedance spring from stretching
+        indefinitely when the robot drives but the human holds
+        the table still.
 
-        !!! Called by:
-            - AlbertTableEnv.step() (EVERY PHYSICS STEP)
+        Adds a physics-level clamp on dx (spring extension).
         """
 
         # ------------------------------------------------------------------
@@ -373,10 +379,12 @@ class AlbertTableImpedanceSim:
         # ================================================================
         # 1) TRANSLATIONAL IMPEDANCE
         # ================================================================
-        dx = handle_pos - ee_pos            # position error
-        dv = handle_vel - ee_vel           # velocity error
-
-        # Raw force before clipping
+        dx = handle_pos - ee_pos     # position error (virtual spring)
+        dv = handle_vel - ee_vel     # velocity error
+  
+        # -----------------------------------------------------------
+        # Compute impedance force with clamped dx
+        # -----------------------------------------------------------
         Fr = -(self.Kp @ dx + self.Dp @ dv)
 
         # Saturation
@@ -394,67 +402,40 @@ class AlbertTableImpedanceSim:
         # ================================================================
         # 2) ROTATIONAL IMPEDANCE (YAW ONLY)
         # ================================================================
-        h_yaw  = p.getEulerFromQuaternion(handle_quat)[2]
-        ee_yaw = p.getEulerFromQuaternion(ee_quat)[2]
+        # h_yaw  = p.getEulerFromQuaternion(handle_quat)[2]
+        # ee_yaw = p.getEulerFromQuaternion(ee_quat)[2]
 
-        yaw_error = ((h_yaw - ee_yaw + np.pi) % (2 * np.pi)) - np.pi
+        # yaw_error = ((h_yaw - ee_yaw + np.pi) % (2 * np.pi)) - np.pi
 
-        # Angular velocities
-        h_ang_vel = p.getLinkState(self.table_id, self.goal_link_idx, computeLinkVelocity=1)[7][2]
-        ee_ang_vel = p.getLinkState(self.albert_id, self.ee_idx, computeLinkVelocity=1)[7][2]
-        yaw_vel_error = h_ang_vel - ee_ang_vel
+     
+        # # Angular velocities
+        # h_ang_vel = p.getLinkState(self.table_id, self.goal_link_idx, computeLinkVelocity=1)[7][2]
+        # ee_ang_vel = p.getLinkState(self.albert_id, self.ee_idx, computeLinkVelocity=1)[7][2]
+        # yaw_vel_error = h_ang_vel - ee_ang_vel
 
-        # Gains match original script
-        K_yaw = 60.0
-        D_yaw = 4.0
-        tau_z = -K_yaw * yaw_error - D_yaw * yaw_vel_error
+        # # Gains match original script
+        # K_yaw = 100 # was 60
+        # D_yaw = 30.0 # was 4.0
+        # tau_z = -K_yaw * yaw_error - D_yaw * yaw_vel_error
 
-        # Apply torque to table
-        p.applyExternalTorque(
-            self.table_id,
-            self.goal_link_idx,
-            [0, 0, tau_z],
-            flags=p.WORLD_FRAME,
-        )
-
-        # ================================================================
-        # 3) BACK-PROJECTION: table force/torque -> robot arm joints
-        # ================================================================
-        # # Compute robot joint Jacobians
-        # joint_indices, q_list, dq_list = self.get_movable_joint_state_arrays(self.albert_id)
-
-        # J_lin, J_ang = p.calculateJacobian(
-        #     self.albert_id,
-        #     self.ee_idx,
-        #     [0, 0, 0],
-        #     q_list,
-        #     dq_list,
-        #     [0.0] * len(q_list),
+        # # Apply torque to table
+        # p.applyExternalTorque(
+        #     self.table_id,
+        #     self.goal_link_idx,
+        #     [0, 0, tau_z],
+        #     flags=p.WORLD_FRAME,
         # )
 
-        # # Restrict to arm joints
-        # J_arm_lin = np.array(J_lin)[:, self.arm_joint_indices]
-        # J_arm_ang = np.array(J_ang)[:, self.arm_joint_indices]
-
-        # # Compute joint torques
-        # tau_lin = J_arm_lin.T @ (-Fr)
-        # tau_rot = J_arm_ang.T @ np.array([0, 0, -tau_z])
-        # tau_total = np.clip(tau_lin + tau_rot, -self.tau_max, self.tau_max)
-
-        # # Apply torques to robot arm
-        # for j, t in zip(self.arm_joint_indices, tau_total):
-        #     p.setJointMotorControl2(
-        #         self.albert_id,
-        #         j,
-        #         controlMode=p.TORQUE_CONTROL,
-        #         force=float(t),
-        #     )
-
+        # ================================================================
         # Diagnostics returned to environment
+        # ================================================================
         self.last_F_xy = Fr[:2]
         self.last_dx_xy = dx[:2]
 
         return Fr[:2], dx[:2], handle_pos[:2], handle_vel[:2]
+
+
+
     
     def reset_table(self):
         start_pos = [0.0, -1.15, 0.5]
@@ -486,6 +467,27 @@ class AlbertTableImpedanceSim:
         for j, q in zip(self.arm_joint_indices, self.arm_q_rigid):
             # velocity=0 so nothing accumulates
             p.resetJointState(self.albert_id, j, float(q), 0.0)
+
+
+    def debug_wheel_forces(self, velocity):
+        """
+        Prints the actual torque being applied by the wheel motors.
+        Used to diagnose 'Bulldozer' behavior.
+        """
+        # 1. Get Joint Indices for Wheels (Check your URDF for exact names!)
+        # Commonly: "wheel_left_joint", "wheel_right_joint"
+        left_idx = self.get_joint_id_by_name(self.albert_id, "wheel_left_joint")
+        right_idx = self.get_joint_id_by_name(self.albert_id, "wheel_right_joint")
+
+        # 2. Get Joint States
+        # p.getJointState returns [pos, vel, reaction_forces, APPLIED_TORQUE]
+        left_state = p.getJointState(self.albert_id, left_idx)
+        right_state = p.getJointState(self.albert_id, right_idx)
+
+        left_torque = left_state[3]
+        right_torque = right_state[3]
+
+        print(f"⚙️ WHEELS | Vel: {velocity:.2f} | Torque L: {left_torque:.2f} | Torque R: {right_torque:.2f}")
 
 
 

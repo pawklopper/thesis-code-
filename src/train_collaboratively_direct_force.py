@@ -23,8 +23,10 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.logger import configure
 
 from rl_env.albert_table_env import AlbertTableEnv
-from controllers.ps5_human_control_impedance import (
-    PS5ImpedanceController
+from controllers.ps5_human_control_direct_force import (
+    init_ps5_controller,
+    read_joystick_force,
+    compute_world_force_from_table,
 )
 
 
@@ -94,28 +96,20 @@ def run_interactive_model(
     logger = configure(tb_dir, ["stdout", "tensorboard"])
     model.set_logger(logger)
 
-    
+    # --------------------------------------------------------
+    # PS5 controller
+    # --------------------------------------------------------
+    js = init_ps5_controller()
+
     # --------------------------------------------------------
     # Initial reset
     # --------------------------------------------------------
     obs, _ = env.reset(Fh_override=np.zeros(3))
-
-    # --------------------------------------------------------
-    # PS5 controller
-    # --------------------------------------------------------
-    human_controller = PS5ImpedanceController(
-        table_id=env.sim.table_id, 
-        link_idx=env.sim.human_goal_link_idx
-    )
-
-    
-    # SNAP GHOST: Reset controller ghost to match reset position
-    start_pos = p.getLinkState(env.sim.table_id, env.sim.human_goal_link_idx)[0]
-    human_controller.ghost_pos = np.array(start_pos[:2], dtype=np.float32)
-
     total_steps, steps_since_goal, goal_id = 0, 0, 1
     goal = np.array(start_goal)
     goal_marker_id = draw_goal_marker(goal)
+
+    Fprev = np.zeros(3, dtype=np.float32)
 
     # Rolling windows for logging
     reward_window = []
@@ -133,8 +127,12 @@ def run_interactive_model(
             # --- Policy action ---
             action, _ = model.predict(obs, deterministic=True)
 
-            # --- Human force via PS5 Impedance Controller ---
-            Fh = human_controller.step(dt=env.sim.dt)
+            # --- Human force via PS5 ---
+            f_local = read_joystick_force(js, force_scale=40.0)
+            f_world = compute_world_force_from_table(f_local, env.sim.table_id)
+
+            Fh = 0.9 * Fprev + 0.1 * np.array([f_world[0], f_world[1], 0.0], dtype=np.float32)
+            Fprev = Fh.copy()
 
             # --- Step environment ---
             obs, rew, terminated, truncated, info = env.step(action, Fh_override=Fh)
@@ -142,14 +140,14 @@ def run_interactive_model(
 
             # Forces
             Fr = env.sim.last_F_xy if hasattr(env.sim, "last_F_xy") else np.zeros(2)
-            Fh_debug = env.sim.last_Fh_xy if hasattr(env.sim, "last_Fh_xy") else np.zeros(2)
+            Fh = env.sim.last_Fh_xy if hasattr(env.sim, "last_Fh_xy") else np.zeros(2)
 
             # Debug info
             if total_steps % 50 == 0:
                 dist = info.get("dist_table_to_goal", float("nan"))
                 print(
                     f"Step={total_steps:06d} | dist={dist:6.3f} | "
-                    f"Fr={Fr} | Fh={Fh_debug} "
+                    f"Fr={Fr} | Fh={Fh} "
                 )
 
             # --- Add transition to replay buffer ---
@@ -217,11 +215,6 @@ def run_interactive_model(
                 except:
                     pass
                 obs, _ = env.reset(Fh_override=np.zeros(3))
-                
-                # SNAP GHOST
-                start_pos = p.getLinkState(env.sim.table_id, env.sim.human_goal_link_idx)[0]
-                human_controller.ghost_pos = np.array(start_pos[:2], dtype=np.float32)
-
                 steps_since_goal = 0
                 goal_marker_id = draw_goal_marker(goal)
                 continue
@@ -245,11 +238,6 @@ def run_interactive_model(
                     goal = new_goal
                     goal_id += 1
                 obs, _ = env.reset(Fh_override=np.zeros(3))
-                
-                # SNAP GHOST
-                start_pos = p.getLinkState(env.sim.table_id, env.sim.human_goal_link_idx)[0]
-                human_controller.ghost_pos = np.array(start_pos[:2], dtype=np.float32)
-
                 steps_since_goal = 0
                 goal_marker_id = draw_goal_marker(goal)
 
@@ -279,15 +267,15 @@ def run_interactive_model(
 # ============================================================
 
 if __name__ == "__main__":
-    base_dir = "runs_19_nov_test"
-    load_run_subdir = "20251119-115051_19_nov_test"
-    model_name = "19_nov_test"
+    base_dir = "runs_18_nov_test"
+    load_run_subdir = "20251118-120841_18_nov_test"
+    model_name = "18_nov_test"
 
     run_interactive_model(
         base_dir=base_dir,
         load_run_subdir=load_run_subdir,
         model_name=model_name,
-        single_goal_mode=True,
+        single_goal_mode=False,
         start_goal=(0.0, 2.0),
         max_runtime_steps=100_000,
     )

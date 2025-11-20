@@ -103,8 +103,8 @@ if __name__ == "__main__":
         warnings.filterwarnings("ignore")
     
     # === ORIGINAL VARIABLE NAMES PRESERVED EXACTLY ===
-    model_name = "13_nov_test"
-    base_log_dir = "runs/offline/runs_13_nov_test"
+    model_name = "19_nov_test"
+    base_log_dir = "runs/offline/runs_19_nov_test"
     render = False
 
     # === ORIGINAL GOAL LIST ===
