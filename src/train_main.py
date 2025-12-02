@@ -19,8 +19,45 @@ from datetime import datetime
 
 from stable_baselines3 import SAC
 from stable_baselines3.common.monitor import Monitor
+# !!! ADDED: Import BaseCallback for TensorBoard logging
+from stable_baselines3.common.callbacks import BaseCallback
 
 from rl_env.albert_table_env import AlbertTableEnv
+
+
+# ============================================================================
+# !!! ADDED: CALLBACK CLASS FOR TENSORBOARD
+# ============================================================================
+class RewardLoggerCallback(BaseCallback):
+    """
+    Custom callback to extract reward components from 'info'
+    and log them to TensorBoard under the 'rewards/' tab.
+    """
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        # Access the 'info' dictionary from the environment
+        # self.locals['infos'] is a list of info dicts (one per env)
+        if "infos" in self.locals:
+            info = self.locals["infos"][0]
+            
+            # List of keys you want to see in TensorBoard
+            # (Matches what you calculate in AlbertTableEnv)
+            keys_to_log = [
+                "progress_reward", 
+                "motion_reward", 
+                "distance_penalty", 
+                "heading_penalty", 
+                "collaboration_reward"
+            ]
+            
+            for key in keys_to_log:
+                # We use .get() or check existence to prevent crashes
+                if key in info:
+                    self.logger.record(f"rewards/{key}", info[key])
+                    
+        return True
 
 
 # ============================================================================
@@ -52,9 +89,18 @@ def train_sac(
     os.makedirs(log_dir, exist_ok=True)
 
     # === Create environment wrapped with Monitor ===
+    # !!! FIX: Added comma after "total_reward" to fix syntax error
     env = Monitor(
         AlbertTableEnv(render=render, goals=goals),
-        filename=os.path.join(log_dir, "monitor.csv")
+        filename=os.path.join(log_dir, "monitor.csv"),
+        info_keywords=(
+            "total_reward",      # <--- Added comma here
+            "progress_reward",
+            "motion_reward",
+            "distance_penalty",
+            "heading_penalty",
+            "collaboration_reward"
+        )
     )
 
     # === SAC MODEL (unchanged) ===
@@ -73,10 +119,15 @@ def train_sac(
     )
 
     print("\nStarting SAC training...")
+    
+    # !!! ADDED: Instantiate the callback
+    callback = RewardLoggerCallback()
+
     model.learn(
         total_timesteps=total_timesteps,
         progress_bar=True,
-        tb_log_name="SAC"
+        tb_log_name="SAC",
+        callback=callback  # !!! ADDED: Pass callback here
     )
 
     # === Save model (unchanged) ===
@@ -87,6 +138,8 @@ def train_sac(
     print(f"\nTraining complete — model saved to {model_path}")
 
     # === Launch TensorBoard (unchanged) ===
+    # Note: TensorBoard will look recursively. 
+    # The logs will be inside log_dir/SAC_1/
     subprocess.Popen(["tensorboard", "--logdir", base_log_dir, "--port", "6006"])
     print("Open http://localhost:6006 to view live training metrics.")
 
@@ -103,16 +156,16 @@ if __name__ == "__main__":
         warnings.filterwarnings("ignore")
     
     # === ORIGINAL VARIABLE NAMES PRESERVED EXACTLY ===
-    model_name = "19_nov_test"
-    base_log_dir = "runs/offline/runs_19_nov_test"
+    model_name = "27_nov_test"
+    base_log_dir = "runs/offline/runs_27_nov_test"
     render = False
 
     # === ORIGINAL GOAL LIST ===
-    goal_list = [(0.0, 2.0)]
+    goal_list = [(2.0, 2.0), (-2.0, -2.0), (-2.0, 2.0), (2.0, -2.0)]
 
     # === ORIGINAL TRAINING CALL EXACTLY REPRODUCED ===
     model = train_sac(
-        total_timesteps=20000,
+        total_timesteps=80000,
         goals=goal_list,
         model_name=model_name,
         base_log_dir=base_log_dir,

@@ -127,8 +127,8 @@ def run_trained_model_conditional_reset(
             Fh = env.sim.last_Fh_xy if hasattr(env.sim, "last_Fh_xy") else np.zeros(2)
             human_action = env.sim.human_action if hasattr(env.sim, "human_action") else "none"
 
-            # Debug info
-            if total_steps % 50 == 0:
+            # # Debug info
+            if total_steps % 3 == 0:
                 dist = info.get("dist_table_to_goal", float("nan"))
                 print(
                     f"Step={total_steps:06d} | dist={dist:6.3f} | "
@@ -178,13 +178,13 @@ if __name__ == "__main__":
     # run_subdir = "20251111-220821_11_nov_test"
 
     # force in obs
-    base_log_dir = "runs/offline/runs_19_nov_test"
-    model_name = "19_nov_test"
-    run_subdir = "20251119-115051_19_nov_test"
+    base_log_dir = "runs/offline/runs_27_nov_test"
+    model_name = "27_nov_test"
+    run_subdir = "20251127-150342_27_nov_test"
 
 
 
-    start_goal = (0.0, 2.0)
+    start_goal = (2.0, 2.0)
 
     print(f"Running trained SAC policy from: {run_subdir}")
     print(f"Start goal: {start_goal}")

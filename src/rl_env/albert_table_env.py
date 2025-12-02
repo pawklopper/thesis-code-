@@ -189,9 +189,14 @@ class AlbertTableEnv(gym.Env):
         if self.use_force_observations:
             Fh_x, Fh_y = self.sim.last_Fh_xy
             Fr_x, Fr_y = self.sim.last_F_xy
+
+            # only use human forces, robot set to zero: 
+            Fr_x = Fr_y = 0.0
         else:
             Fh_x = Fh_y = 0.0
             Fr_x = Fr_y = 0.0
+
+        
 
         return np.array([
             dx_t, dy_t, # table 
@@ -225,6 +230,8 @@ class AlbertTableEnv(gym.Env):
         goal_xy = self.goal[:2]
 
         dir_to_goal = goal_xy - table_xy
+
+        # normalize reward vector so it works for the speed toward goal + efficiency reward
         dir_to_goal /= np.linalg.norm(dir_to_goal) + 1e-6
 
         speed_toward_goal = np.dot(tv_xy, dir_to_goal)
@@ -246,110 +253,188 @@ class AlbertTableEnv(gym.Env):
         Fh_xy = self.sim.last_Fh_xy
         Fr_xy = self.sim.last_F_xy
 
-        efficiency_reward = self.compute_efficiency_reward(dir_to_goal, tv_xy, Fh_xy, Fr_xy)
+        collaboration_reward = self.compute_collaboration_reward(dir_to_goal)
 
         # final reward
         total_reward = (
             progress_reward +
             motion_reward +
             distance_penalty +
-            heading_penalty + efficiency_reward
+            heading_penalty + collaboration_reward
         )
-        if self.step_count % 50 == 0: 
-            print(f"progress reward {progress_reward}, motion reward {motion_reward}, distance_penalty: {distance_penalty}, heading_penalty: {heading_penalty}, efficiency_reward: {efficiency_reward}")
 
-        return total_reward, progress_reward, distance_penalty, heading_penalty
+        # if self.step_count % 50 == 0: 
+        #     print(f"progress reward {progress_reward}, motion reward {motion_reward}, distance_penalty: {distance_penalty}, heading_penalty: {heading_penalty}, collaboration_reward: {collaboration_reward}")
+
+        return total_reward, progress_reward, motion_reward, distance_penalty, heading_penalty, collaboration_reward
     
 
 
-    def compute_efficiency_reward(self, dir_to_goal, tv_xy, Fh_xy, Fr_xy):
-            """
-            Cooperative Efficiency Reward (Normal Mode)
-            
-            Measures the ratio of 'Useful Force' to 'Total Effort'.
-            
-            Returns:
-                float: Value roughly between -1.0 and 1.0
-                1.0  = Perfect Alignment (Synergy)
-                0.0  = Wasted Energy (Orthogonal or Cancellation)
-                -1.0 = Counter-Productive (Sabotage)
-            """
-        
+    def compute_collaboration_reward(self, dir_to_goal):
+        """
+        Collaboration reward based on:
+        - human force direction (intent)
+        - robot base velocity direction (motion)
+        - only rewarded when human acts toward the goal (helpfulness)
 
-            # 2. Calculate Vectors
-            # Team Vector (Resultant)
-            F_team = Fr_xy + Fh_xy
-            
-            # Useful Force (Scalar projection onto goal line)
-            # How much of our combined force is actually helping?
-            F_useful = np.dot(F_team, dir_to_goal)
+        Returns:
+            collab_reward (float)
+        """
 
-            # 3. Calculate Cost
-            # Sum of magnitudes (The "fuel cost" of the team)
-            # We use magnitudes separately so that fighting forces sum up to high cost
-            cost = np.linalg.norm(Fr_xy) + np.linalg.norm(Fh_xy) + 1e-6
+        # Human force (world frame)
+        Fh = np.array(self.sim.last_Fh_xy, dtype=np.float32)
+        Fh_norm = np.linalg.norm(Fh)
 
-            # 4. The Efficiency Ratio
-            efficiency = F_useful / cost
-            
-            # Tuning Gain
-            k_collab = 1.0
-            
-            return k_collab * efficiency
+        if Fh_norm < 1e-6:
+            return 0.0   # no meaningful human input
+
+        # -------------------------------------------------------
+        # 1) HUMAN HELPFULNESS (are they pushing toward the goal?)
+        # -------------------------------------------------------
+        Fh_goal = float(np.dot(Fh, dir_to_goal))  # signed projection
+
+        # Normalize helpfulness into [0, 1]
+        helpfulness = max(0.0, Fh_goal / (Fh_norm + 1e-6))
+
+        if helpfulness <= 1e-6:
+            return 0.0   # human is not helping the task → no collaboration shaping
+
+        # -------------------------------------------------------
+        # 2) ROBOT BASE VELOCITY IN WORLD FRAME
+        # -------------------------------------------------------
+        base_state = self._last_env_ob[0]["robot_0"]["joint_state"]
+
+        # 1. Get World Velocity Vector [vx, vy]
+        vx = base_state["velocity"][0]
+        vy = base_state["velocity"][1]
+        v_world_vec = np.array([vx, vy])
+
+        # 2. Get Robot Heading Vector (The "Nose" of the robot)
+        # Use the math we verified earlier: [sin, -cos]
+        robot_yaw = base_state["position"][2]
+        heading_vec = np.array([np.sin(robot_yaw), -np.cos(robot_yaw)])
+
+        # 3. Calculate Signed Speed (Dot Product)
+        v_r = float(np.dot(v_world_vec, heading_vec))
+
+
+        # Convert to world frame
+        heading_unit = np.array([
+            np.sin(robot_yaw),
+            -np.cos(robot_yaw)
+        ], dtype=np.float32)
+
+        v_robot_xy = heading_unit * v_r
+        v_norm = np.linalg.norm(v_robot_xy)
+
+        if v_norm < 1e-6:
+            return 0.0  # robot not moving meaningfully → no collaboration signal
+
+        # -------------------------------------------------------
+        # 3) ALIGNMENT BETWEEN HUMAN FORCE AND ROBOT MOTION
+        # -------------------------------------------------------
+        alignment = float(
+            np.dot(Fh, v_robot_xy) /
+            ((Fh_norm * v_norm) + 1e-6)
+        )
+        # alignment ∈ [-1, 1]
+
+        # -------------------------------------------------------
+        # 4) FINAL COLLABORATION SCORE
+        # -------------------------------------------------------
+        k_collab = 1.0  # tune 0.2–0.5 depending on strength needed
+
+        collab_reward = k_collab * helpfulness * alignment
+        return float(collab_reward)
+
     
-    def apply_directional_leash(self, action):
-        """
-        Simplified Leash:
-        Only checks if the commanded linear velocity (v) would increase distance.
-        Does not perform complex vector projection.
-        """
+
+    def apply_progressive_leash(self, action):
+        v_cmd, w_cmd = action
         
-        # 1. Get Spring Vector
-        dx_xy = self.sim.last_dx_xy
-        spring_len = float(np.linalg.norm(dx_xy))
+        # # NOTE: I commented this out so the function works with the actual agent input!
+        # action = np.array([0.0, -0.3])
+        # v_cmd, w_cmd = action
+        # print("action", action)
         
-        MAX_STRETCH = 0.25 # used to be 0.25
+        # --- CONFIG ---
+        START_BRAKE_RADIUS = 0.2
+        MAX_BRAKE_RADIUS   = 0.4 
         
-        # If we are in the safe zone, do nothing
-        if spring_len <= MAX_STRETCH:
+        # 1. State Reading
+        ee_pos = np.array(p.getLinkState(self.sim.albert_id, self.sim.ee_idx)[0])[:2]
+        h_pos  = np.array(p.getLinkState(self.sim.table_id, self.sim.goal_link_idx)[0])[:2]
+        
+        robot_pos, robot_orn = p.getBasePositionAndOrientation(self.sim.albert_id)
+        robot_xy = np.array(robot_pos[:2])
+        robot_yaw = p.getEulerFromQuaternion(robot_orn)[2]
+
+
+        # Vector from Robot Center -> EE (Lever Arm)
+        r_arm = ee_pos - robot_xy
+
+        # Vector from EE -> Table (Green Target Vector)
+        vec_to_table = h_pos - ee_pos
+        current_stretch = float(np.linalg.norm(vec_to_table))
+
+        # --- CONSTRUCT VECTORS FOR LOGIC ---
+        
+        # 1. Unit Heading Vector (0 deg = -y)
+        heading_unit = np.array([np.sin(robot_yaw), -np.cos(robot_yaw)]) 
+        
+        # 2. Actual Linear Velocity Vector (Red) - Includes direction of v_cmd
+        v_linear_vec = heading_unit * v_cmd
+
+        # 3. Swing Velocity Vector (Blue)
+        # Tangential velocity = [-y, x] * w
+        v_swing_vec = np.array([-r_arm[1], r_arm[0]]) * w_cmd
+
+    
+        # --------------------------------------------------------
+        # LOGIC (Vector-Based)
+        # --------------------------------------------------------
+        
+        # Safe Zone?
+        if current_stretch < START_BRAKE_RADIUS:
             return action
 
-        # ----------------------------------------------------------
-        # 2. Determine alignment (Am I facing the table?)
-        # ----------------------------------------------------------
-        robot_yaw = self._last_env_ob[0]["robot_0"]["joint_state"]["position"][2]
         
-        # Robot Forward Vector (using your coordinate system: 0 is -y)
-        robot_forward = np.array([np.sin(robot_yaw), -np.cos(robot_yaw)])
-        
-        # Vector pointing FROM Robot TO Table
-        vec_to_table = dx_xy 
-        
-        # Dot product tells us alignment:
-        # > 0 : Table is mostly IN FRONT (roughly +/- 90 deg)
-        # < 0 : Table is mostly BEHIND (roughly +/- 90 deg)
-        alignment = float(np.dot(robot_forward, vec_to_table))
-        
-        # ----------------------------------------------------------
-        # 3. Gate the Velocity Command (v)
-        # ----------------------------------------------------------
-        v_cmd = action[0]
-        
-        # CASE A: Table is BEHIND me (alignment < 0) AND I try to drive FORWARD (v > 0)
-        # -> This moves me away. STOP.
-        if alignment < 0 and v_cmd > 0:
-            #print("Leash: Stop (Table behind, driving forward)")
-            action[0] = 0.0
-            
-        # CASE B: Table is IN FRONT (alignment > 0) AND I try to drive BACKWARD (v < 0)
-        # -> This moves me away. STOP.
-        elif alignment > 0 and v_cmd < 0:
-            #print("Leash: Stop (Table in front, driving backward)")
-            action[0] = 0.0
-            
-        return action
+        # Calculate Brake Scale
+        fraction = (current_stretch - START_BRAKE_RADIUS) / (MAX_BRAKE_RADIUS - START_BRAKE_RADIUS)
+        velocity_scale = 1.0 - np.clip(fraction, 0.0, 1.0)
 
+        # RULE A: LINEAR
+        # Check Dot Product: Red vs Green
+        # If < 0, they point in opposite directions (Driving Away)
+        linear_proj = float(np.dot(v_linear_vec, vec_to_table))
+        
+        v_final = v_cmd
+        if linear_proj < 0: 
+            v_final = v_cmd * velocity_scale
 
+        # RULE B: ANGULAR VELOCITY (Side/Cross Product Logic)
+        # ---------------------------------------------------
+        # We use Cross Product here because rotation is about "Left vs Right"
+        # Result = (Arm_x * Spring_y) - (Arm_y * Spring_x)
+        torque_direction = (r_arm[0] * vec_to_table[1]) - (r_arm[1] * vec_to_table[0])
+        
+        w_final = w_cmd
+        
+        # LOGIC:
+        # If torque > 0 (Table is Left/CCW) AND w > 0 (Turning Right/CW) -> BAD
+
+        if torque_direction > 0.01 and w_cmd > 0.01:
+            w_final = w_cmd * velocity_scale
+            
+        # If torque < 0 (Table is Right/CW) AND w < 0 (Turning Left/CCW) -> BAD
+        elif torque_direction < -0.01 and w_cmd < -0.01:
+            w_final = w_cmd * velocity_scale
+
+        #Optional: Print if braking happens
+        # if velocity_scale < 1.0:
+        #     print(f"Brake! Scale:{velocity_scale:.2f} | v:{v_cmd:.2f}->{v_final:.2f} | w:{w_cmd:.2f}->{w_final:.2f}")
+
+        return np.array([v_final, w_final])
 
     # ---------------------------------------------------------------------
     #                               STEP
@@ -389,8 +474,6 @@ class AlbertTableEnv(gym.Env):
         # 3) HUMAN INTERACTION: RULE-BASED OR EXTERNAL OVERRIDE
         # -------------------------------------------------------
 
-        # 3) HUMAN INTERACTION: EXTERNAL OVERRIDE OR RULE-BASED
-
         if self._external_force_active and (Fh_override is not None):
             # external human force from PS5
             handle_pos = p.getLinkState(self.sim.table_id, self.sim.human_goal_link_idx)[0]
@@ -416,25 +499,22 @@ class AlbertTableEnv(gym.Env):
                 self.sim.last_Fh_xy = np.zeros(2)
                 self.sim.human_action = "none"
 
+        # 2. READ DRAG & MODULATE ROBOT
 
-        
-        # -------------------------------------------------------
-        # 3.5) Directional Leash Gating (prevents runaway robot)
-        # -------------------------------------------------------
-        action = self.apply_directional_leash(action)
-
+        v_final, w_final = self.apply_progressive_leash(action)
 
         # -------------------------------------------------------
         # 4) APPLY ROBOT BASE VELOCITY COMMANDS (URDFenv)
         # -------------------------------------------------------
         full = np.zeros(self.sim.env.n(), dtype=float)
-        full[0], full[1] = action              # forward velocity and yaw rate
+        full[0], full[1] = v_final, w_final              # forward velocity and yaw rate
 
         ob = self.sim.env.step(full)           # physics step for mobile base
         self._last_env_ob = ob
 
         # force the arm back to its rigid pose after physics integration
         self.sim.enforce_rigid_arm()
+
 
         # -------------------------------------------------------
         # 5) GOAL DISTANCE + REWARD
@@ -450,7 +530,7 @@ class AlbertTableEnv(gym.Env):
         )
         heading_diff = wrap_angle(table_yaw - robot_yaw)
 
-        reward, progress_reward, distance_penalty, heading_penalty = (
+        reward, progress_reward, motion_reward, distance_penalty, heading_penalty, collaboration_reward = (
             self.compute_reward(dist, self.prev_dist, heading_error_bi, heading_diff)
         )
 
@@ -461,12 +541,17 @@ class AlbertTableEnv(gym.Env):
         # -------------------------------------------------------
         terminated = dist < 0.4
         if terminated:
-            print(f"Reached goal at step: {self.step_count}")
+            print(f"[CHECK] Reached goal at step: {self.step_count}")
             reward += 50
 
         truncated = self.step_count >= self.max_steps
         self.step_count += 1
 
+
+        # -------------------------------------------------------
+        # 6) TEST SMALL PUNISHMENT FOR STANDING STILL
+        # -------------------------------------------------------
+        
         if self.render_mode:
             time.sleep(self.sim.dt)
 
@@ -477,15 +562,15 @@ class AlbertTableEnv(gym.Env):
             "dist_table_to_goal": dist,
             "heading_error": float(heading_error),
             "heading_error_bi": float(heading_error_bi),
+            "total_reward": reward,
             "progress_reward": progress_reward,
+            "motion_reward": motion_reward, 
             "distance_penalty": distance_penalty,
             "heading_penalty": heading_penalty,
+            "collaboration_reward": collaboration_reward,
             "human_action": self.sim.human_action,
         }
 
-        # debug wheels: 
-        if self.step_count % 10 == 0:
-            self.sim.debug_wheel_forces(action[0])
 
         return self._get_obs(), reward, terminated, truncated, info
 
@@ -581,6 +666,14 @@ class AlbertTableEnv(gym.Env):
         # ===================================================
         # COMMON SETTLE STEPS FOR BOTH CASES
         # ===================================================
+
+
+        # ===================================================
+        # 🔗 CREATE CONNECTION (The New Step)
+        # ===================================================
+    
+        
+        self.sim.create_connection_impedance()
 
         # Impedance settle step
         base_state = self._last_env_ob[0]["robot_0"]["joint_state"]

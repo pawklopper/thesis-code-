@@ -6,9 +6,6 @@ class PS5ImpedanceController:
     """
     Interprets Joystick input as moving a virtual 'Ghost Hand'.
     Applies a spring force between this Ghost Hand and the Table Handle.
-    
-    Includes a 'Leash' mechanism so the ghost cannot move infinitely far
-    from the table handle.
     """
     def __init__(self, table_id, link_idx):
         self.table_id = table_id
@@ -27,19 +24,22 @@ class PS5ImpedanceController:
             self.js = None
 
         # --- TUNING PARAMETERS ---
-        self.Kp = np.array([300.0, 300.0]) 
-        self.Dp = np.array([60.0, 60.0])
-        self.GHOST_SPEED = 3.0  # m/s (How fast the ghost moves)
+        self.Kp = np.array([200.0, 200.0]) 
+        self.Dp = np.array([50.0, 50.0])
+        self.GHOST_SPEED = 3.0 
         
-        # --- NEW: TETHER RADIUS ---
-        self.MAX_RADIUS = 0.5   # Meters (The leash length)
+        # Geometry Limits
+        self.MAX_RADIUS = 0.4   
+        
+        # Force Limits
+        self.MAX_FORCE = 40.0  # <--- Added strictly here
         
         # Initialize Ghost at current handle position
         start_pos = p.getLinkState(self.table_id, self.link_idx)[0]
         self.ghost_pos = np.array(start_pos[:2], dtype=np.float32)
         
         self.marker_id = None
-        self.line_id = None  # To draw the spring line
+        self.line_id = None 
 
     def step(self, dt=0.01):
         """
@@ -50,16 +50,14 @@ class PS5ImpedanceController:
 
         pygame.event.pump()
         
-        # 1. READ INPUT (Velocity Command for Ghost)
+        # 1. READ INPUT 
         dx = self.js.get_axis(0)
-        dy = -self.js.get_axis(1) # Invert Y for typical joystick Y-axis mapping
+        dy = -self.js.get_axis(1)
         
         if abs(dx) < 0.1: dx = 0.0
         if abs(dy) < 0.1: dy = 0.0
         
-        # 2. ASSIGN INPUT DIRECTLY TO WORLD FRAME VELOCITY
-        # This is the key change: we remove the rotation matrix calculation.
-        # +X is now dx, +Y is now dy.
+        # 2. ASSIGN INPUT TO WORLD VELOCITY
         vx_world = dx
         vy_world = dy
         
@@ -67,55 +65,48 @@ class PS5ImpedanceController:
         self.ghost_pos[0] += vx_world * self.GHOST_SPEED * dt
         self.ghost_pos[1] += vy_world * self.GHOST_SPEED * dt
 
-        # -------------------------------------------------------
-        # 4. CLAMP GHOST TO RADIUS (The "Leash" Logic)
-        # -------------------------------------------------------
-        # Get actual handle state
+        # 4. CLAMP GHOST TO RADIUS (The "Leash")
         state = p.getLinkState(self.table_id, self.link_idx, computeLinkVelocity=1)
         curr_pos = np.array(state[0][:2])
         curr_vel = np.array(state[6][:2])
         
-        # Vector from Handle -> Ghost
         vec_to_ghost = self.ghost_pos - curr_pos
         dist = np.linalg.norm(vec_to_ghost)
         
-        # If Ghost is too far, pull it back to the rim of the circle
         if dist > self.MAX_RADIUS:
-            # Normalize vector and scale to max radius
             direction = vec_to_ghost / dist
             self.ghost_pos = curr_pos + direction * self.MAX_RADIUS
 
-        # -------------------------------------------------------
         # 5. CALCULATE IMPEDANCE FORCE
-        # -------------------------------------------------------
-        # Recalculate pos_error after clamping
         pos_error = self.ghost_pos - curr_pos
         
-        # Note: Impedance force calculation is always in the World frame
-        # because curr_pos/curr_vel are in the World frame.
+        # Raw calculated force
         force_2d = self.Kp * pos_error - self.Dp * curr_vel
         
-        # Safety Clip
-        force_2d = np.clip(force_2d, -40.0, 40.0)
+        # --- CHANGED: CIRCULAR SAFETY CLIP ---
+        # Check the total magnitude (length) of the force vector
+        force_mag = np.linalg.norm(force_2d)
+        
+        if force_mag > self.MAX_FORCE:
+            # Scale the vector down to exactly MAX_FORCE (70N) 
+            # while preserving its direction
+            force_2d = force_2d * (self.MAX_FORCE / force_mag)
         
         # 6. VISUALIZE
         self._draw_ghost(curr_pos)
         
-        # Return 3D Force (Z=0)
         return np.array([force_2d[0], force_2d[1], 0.0], dtype=np.float32)
 
     def _draw_ghost(self, handle_pos_2d):
         ghost_3d = [self.ghost_pos[0], self.ghost_pos[1], 0.85]
         handle_3d = [handle_pos_2d[0], handle_pos_2d[1], 0.85]
 
-        # Draw Sphere
         if self.marker_id is None:
             vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.04, rgbaColor=[0, 1, 0, 0.8])
             self.marker_id = p.createMultiBody(baseVisualShapeIndex=vis, basePosition=ghost_3d)
         else:
             p.resetBasePositionAndOrientation(self.marker_id, ghost_3d, [0,0,0,1])
             
-        # Draw Line (The "Spring")
         if self.line_id is not None:
             p.removeUserDebugItem(self.line_id)
             
