@@ -51,6 +51,7 @@ def run_trained_model_conditional_reset(
     run_subdir: str,
     start_goal=(0.0, -2.0),
     max_runtime_steps: int = 100_000,
+    use_obstacles = False,
 ):
     """
     Runs a trained SAC policy on the Albert + Table impedance simulation
@@ -65,7 +66,7 @@ def run_trained_model_conditional_reset(
         raise FileNotFoundError(f"Model not found at: {model_path}")
 
     # === Load environment and trained model ===
-    env = AlbertTableEnv(render=True, goals=[start_goal])
+    env = AlbertTableEnv(render=True, goals=[start_goal], use_obstacles=use_obstacles)
     model = SAC.load(model_path, env=env)
     print(f"Loaded model from: {model_path}")
 
@@ -128,7 +129,7 @@ def run_trained_model_conditional_reset(
             human_action = env.sim.human_action if hasattr(env.sim, "human_action") else "none"
 
             # # Debug info
-            if total_steps % 3 == 0:
+            if total_steps % 10000 == 0:
                 dist = info.get("dist_table_to_goal", float("nan"))
                 print(
                     f"Step={total_steps:06d} | dist={dist:6.3f} | "
@@ -172,19 +173,22 @@ def run_trained_model_conditional_reset(
 # ============================================================
 
 if __name__ == "__main__":
-    # no force in obs
-    # base_log_dir = "runs_11_nov_test"
-    # model_name = "11_nov_test"
-    # run_subdir = "20251111-220821_11_nov_test"
-
-    # force in obs
-    base_log_dir = "runs/offline/runs_27_nov_test"
-    model_name = "27_nov_test"
-    run_subdir = "20251127-150342_27_nov_test"
 
 
+    # shows some positivity however, drives as long as it can towards the obstacle, 
+    # does not hit it, and then tries to get the tables as close as possible to the goal.
+    # base_log_dir = "runs/offline/runs_2_dec_test"
+    # model_name = "2_dec_test"
+    # run_subdir = "20251202-162934_2_dec_test"
 
-    start_goal = (2.0, 2.0)
+
+    base_log_dir = "runs/offline/jan/runs_2_jan_test"
+    model_name = "2_jan_test"
+    run_subdir = "20260102-161938_2_jan_test"
+    use_obstacles = True
+
+
+    start_goal = (0.0, 5.0)
 
     print(f"Running trained SAC policy from: {run_subdir}")
     print(f"Start goal: {start_goal}")
@@ -195,4 +199,5 @@ if __name__ == "__main__":
         run_subdir=run_subdir,
         start_goal=start_goal,
         max_runtime_steps=100_000,
+        use_obstacles=use_obstacles
     )

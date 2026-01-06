@@ -52,11 +52,12 @@ def run_interactive_model(
     start_goal=(0.0, -2.0),
     max_runtime_steps=100_000,
     warmup_steps=1024, 
+    use_obstacles = True
 ):
     # --------------------------------------------------------
     # Paths
     # --------------------------------------------------------
-    offline_dir = os.path.join("runs", "offline", base_dir, load_run_subdir)
+    offline_dir = os.path.join("runs", "offline", "dec",base_dir, load_run_subdir)
     pretrained_path = os.path.join(offline_dir, f"{model_name}.zip")
     
     if not os.path.exists(pretrained_path):
@@ -79,7 +80,7 @@ def run_interactive_model(
     # Attach new environment
     # --------------------------------------------------------
     # We pass 'options' to ensure reward_weights are set if needed (default is all 1.0)
-    env = AlbertTableEnv(render=True, goals=[start_goal])
+    env = AlbertTableEnv(render=True, goals=[start_goal], use_obstacles=use_obstacles)
     model.set_env(env)
 
     # --------------------------------------------------------
@@ -145,6 +146,8 @@ def run_interactive_model(
             # --- Step environment ---
             obs, rew, terminated, truncated, info = env.step(action, Fh_override=Fh)
             done = terminated or truncated
+
+           
 
             # -------------------------------------------------------
             # !!! ADDED: Collect individual rewards for logging
@@ -294,16 +297,17 @@ def run_interactive_model(
 # ============================================================
 
 if __name__ == "__main__":
-    base_dir = "runs_27_nov_test"
-    load_run_subdir = "20251127-150342_27_nov_test" # Update this to your latest run!
-    model_name = "27_nov_test"
+    base_dir = "runs_16_dec_test"
+    load_run_subdir = "20251216-164514_16_dec_test" # Update this to your latest run!
+    model_name = "16_dec_test"
 
     run_interactive_model(
         base_dir=base_dir,
         load_run_subdir=load_run_subdir,
         model_name=model_name,
-        single_goal_mode=False,
-        start_goal=(0.0, -3.0),
+        single_goal_mode=True,
+        start_goal=(0.0, 5.0),
         max_runtime_steps=100_000,
-        warmup_steps=1002 
+        warmup_steps=1002,
+        use_obstacles=True
     )

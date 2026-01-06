@@ -49,7 +49,8 @@ class RewardLoggerCallback(BaseCallback):
                 "motion_reward", 
                 "distance_penalty", 
                 "heading_penalty", 
-                "collaboration_reward"
+                "obstacle_penalty",
+                "bypass_reward",
             ]
             
             for key in keys_to_log:
@@ -76,7 +77,8 @@ def train_sac(
     gamma,
     train_freq,
     gradient_steps,
-    render=False
+    render=False, 
+    use_obstacles=False,
 ):
     """
     Launch SAC training with simplified Albert–table environment.
@@ -91,7 +93,7 @@ def train_sac(
     # === Create environment wrapped with Monitor ===
     # !!! FIX: Added comma after "total_reward" to fix syntax error
     env = Monitor(
-        AlbertTableEnv(render=render, goals=goals),
+        AlbertTableEnv(render=render, goals=goals, use_obstacles=use_obstacles),
         filename=os.path.join(log_dir, "monitor.csv"),
         info_keywords=(
             "total_reward",      # <--- Added comma here
@@ -99,7 +101,8 @@ def train_sac(
             "motion_reward",
             "distance_penalty",
             "heading_penalty",
-            "collaboration_reward"
+            "obstacle_penalty", 
+            "bypass_reward",
         )
     )
 
@@ -156,16 +159,17 @@ if __name__ == "__main__":
         warnings.filterwarnings("ignore")
     
     # === ORIGINAL VARIABLE NAMES PRESERVED EXACTLY ===
-    model_name = "27_nov_test"
-    base_log_dir = "runs/offline/runs_27_nov_test"
+    model_name = "2_jan_test"
+    base_log_dir = "runs/offline/jan/runs_2_jan_test"
     render = False
+    use_obstacles=True
 
     # === ORIGINAL GOAL LIST ===
-    goal_list = [(2.0, 2.0), (-2.0, -2.0), (-2.0, 2.0), (2.0, -2.0)]
+    goal_list = [(0.0, 5.0)]
 
     # === ORIGINAL TRAINING CALL EXACTLY REPRODUCED ===
     model = train_sac(
-        total_timesteps=80000,
+        total_timesteps=60000,
         goals=goal_list,
         model_name=model_name,
         base_log_dir=base_log_dir,
@@ -177,4 +181,5 @@ if __name__ == "__main__":
         train_freq=32,
         gradient_steps=32,
         render=render,
+        use_obstacles=use_obstacles
     )

@@ -45,13 +45,21 @@ class AlbertTableImpedanceSim:
         # 3. IMPEDANCE TUNING (Centralized)
         # -------------------------------------------------------------------
         # Stiffness (Kp): How hard it pulls to correct position errors (N/m)
-        self.imp_stiffness = 900.0 # used to be 300
+        self.imp_stiffness = 10000.0 # used to be 300
         
         # Damping (Kd): How much it resists velocity differences (N/(m/s))
-        self.imp_damping = 180.0 # used to be 60
+        self.imp_damping = 2 * np.sqrt(20 * self.imp_stiffness) # used to be 60
+
+        self.imp_max_force = 1000.0 # used to be 40
+
+        # self.imp_stiffness = 300.0 # used to be 300
         
-        # Saturation: Max force allowed to prevent explosions (N)
-        self.imp_max_force = 40.0 # used to be 40
+        # # Damping (Kd): How much it resists velocity differences (N/(m/s))
+        # self.imp_damping = 60 # used to be 60
+        
+        
+        # # Saturation: Max force allowed to prevent explosions (N)
+        # self.imp_max_force = 40.0 # used to be 40
 
         # -------------------------------------------------------------------
         # 4. STATE VARIABLES
@@ -320,6 +328,29 @@ class AlbertTableImpedanceSim:
         # UNIFORM stiffness for both axes as requested
         f_local_x = -(self.imp_stiffness * x_error + self.imp_damping * local_vx)
         f_local_y = -(self.imp_stiffness * y_error + self.imp_damping * local_vy)
+
+
+        # ==========================================================
+        # DEBUG START: AM I PUSHING OR PULLING?
+        # ==========================================================
+        # Convention based on your coordinate system:
+        # local_y is Longitudinal (Forward/Back)
+        # f_local_y is the force APPLIED TO THE TABLE.
+        
+        # If f_local_y is NEGATIVE -> Vector points back to robot -> PULLING (Tension)
+        # If f_local_y is POSITIVE -> Vector points away from robot -> PUSHING (Compression)
+        
+        # action_type = "UNKNOWN"
+        # if f_local_y < -10.0:
+        #     action_type = f"⬇️ PULLING (Tension) | Force: {f_local_y:.1f} N"
+        # elif f_local_y > 10.0:
+        #     action_type = f"⬆️ PUSHING (Compression) | Force: {f_local_y:.1f} N"
+        # else:
+        #     action_type = f"⏺️ NEUTRAL             | Force: {f_local_y:.1f} N"
+
+        # Only print every 20 steps to avoid flooding console
+        # (Assuming you add a counter or just print continuously for a short test)
+        # print(f"[{action_type}]  Dist Error: {y_error:.3f} m")
         
         # 4. Rotate Force Back to World Frame
         # World Fx = c*Fx - s*Fy
@@ -394,3 +425,4 @@ class AlbertTableImpedanceSim:
         # RED: The Spring Deformation (Ideal Point -> Real Handle)
         # This is the visual representation of the Force
         p.addUserDebugLine(ideal_pos, h_pos, [1, 0, 0], lineWidth=4, lifeTime=0.1)
+        
