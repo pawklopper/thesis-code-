@@ -159,8 +159,8 @@ if __name__ == "__main__":
         warnings.filterwarnings("ignore")
     
     # === ORIGINAL VARIABLE NAMES PRESERVED EXACTLY ===
-    model_name = "2_jan_test"
-    base_log_dir = "runs/offline/jan/runs_2_jan_test"
+    model_name = "9_jan_test"
+    base_log_dir = "runs/offline/jan/runs_9_jan_test"
     render = False
     use_obstacles=True
 
@@ -169,7 +169,7 @@ if __name__ == "__main__":
 
     # === ORIGINAL TRAINING CALL EXACTLY REPRODUCED ===
     model = train_sac(
-        total_timesteps=60000,
+        total_timesteps=100000,
         goals=goal_list,
         model_name=model_name,
         base_log_dir=base_log_dir,

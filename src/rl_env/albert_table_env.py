@@ -45,9 +45,11 @@ import pybullet as p
 from controllers.impedance_sim import AlbertTableImpedanceSim, wrap_angle
 
 from rl_env.obstacles_and_sensing import MapMaker
+from rl_env.obstacles_and_sensing import LidarMixin
 
 
-class AlbertTableEnv(gym.Env):
+
+class AlbertTableEnv(LidarMixin, gym.Env):
     """
     Simplified Gymnasium environment focusing on table motion + robot/table heading alignment.
 
@@ -67,7 +69,24 @@ class AlbertTableEnv(gym.Env):
     # ---------------------------------------------------------------------
     #                           CONSTRUCTOR
     # ---------------------------------------------------------------------
-    def __init__(self, render=False, max_steps=1200, use_obstacles=False, goals=None):
+    def __init__(
+        self,
+        render: bool = False,
+        max_steps: int = 1200,
+        use_obstacles: bool = False,
+        goals=None,
+        # --------------------------
+        # LiDAR configuration (forwarded to LidarMixin)
+        # --------------------------
+        use_lidar: bool = True,
+        lidar_num_rays: int = 36,
+        lidar_range: float = 3.0,
+        lidar_height: float = 0.25,
+        lidar_front_half_angle: float = np.deg2rad(60),
+        lidar_max_iters: int = 4,
+        lidar_eps_adv: float = 1e-3,
+        lidar_debug: bool = False,
+    ):
         """
         Parameters
         ----------
@@ -75,456 +94,87 @@ class AlbertTableEnv(gym.Env):
             Whether to launch PyBullet GUI.
         max_steps : int
             Hard truncation limit for an episode.
+        use_obstacles : bool
+            Whether to spawn obstacles (MapMaker) on first episode.
         goals : list of (float, float)
             List of goal positions; one is sampled each reset().
+
+        LiDAR params are forwarded to LidarMixin.__init__().
         """
 
-        super().__init__()
+        # IMPORTANT: cooperative init so LidarMixin (and gym.Env) initialize properly
+        super().__init__(
+            use_lidar=use_lidar,
+            lidar_num_rays=lidar_num_rays,
+            lidar_range=lidar_range,
+            lidar_height=lidar_height,
+            lidar_front_half_angle=lidar_front_half_angle,
+            lidar_max_iters=lidar_max_iters,
+            lidar_eps_adv=lidar_eps_adv,
+            lidar_debug=lidar_debug,
+        )
 
+        # --------------------------
+        # Core env bookkeeping
+        # --------------------------
         self.render_mode = render
         self.max_steps = max_steps
         self.step_count = 0
 
-        # goals are stored as np arrays; first one is used initially
+        # Goals
         self.goals = [np.array(g, dtype=np.float32) for g in (goals or [(1.5, -2.0)])]
         self.goal = self.goals[0]
         print(f"Goal is: {self.goal}")
 
-        # Action = robot velocity command: (v, omega)
-        # These bounds match your original script
-        # original action space
+        # Action space: robot base velocity command (v, omega)
         self.action_space = spaces.Box(
             low=np.array([-0.5, -1.0], dtype=np.float32),
-            high=np.array([0.5, 1.0], dtype=np.float32)
+            high=np.array([0.5, 1.0], dtype=np.float32),
         )
 
-        self.obstacle_pos = None      
+        # Obstacles (optional)
+        self.use_obstacles = use_obstacles
+        self.obstacle_pos = None
         self.obstacle_extents = None
 
-
-
-
-        # !!! CROSS-FILE CREATION
-        #     Create the full impedance physics engine
+        # Physics simulator (PyBullet + robot/table + impedance + human controller)
         self.sim = AlbertTableImpedanceSim(render=self.render_mode)
 
-        # For reward shaping: remember last goal distance
+        # Reward shaping memory
         self.prev_dist = None
 
         # Latest URDFenv observation (dict structure returned by URDFenv)
         self._last_env_ob = None
 
         # Toggle: include human/robot forces in observation?
-        # True  → real forces (Fh, Fr)
-        # False → zeros in observations
-        self.use_force_observations = True   # <-- YOU CAN SWITCH THIS
-
-
-        # another toggle use obstacles: 
-        self.use_obstacles = use_obstacles
-
-
+        self.use_force_observations = True  # <-- YOU CAN SWITCH THIS
         if self.use_force_observations:
             print("OBSERVATION MODE: REAL FORCES INCLUDED")
         else:
             print("OBSERVATION MODE: FORCES ZEROED")
 
+        # Robot footprint used by avoidance logic
         self.robot_radius = 0.5  # set to your base footprint radius
 
-       # --------------------------
-        # LiDAR (light) configuration
         # --------------------------
-        self.use_lidar = True
-        self.lidar_num_rays = 36
-        self.lidar_range = 3.0          # max ray length
-        self.lidar_height = 0.25        # ray Z origin (adjust if needed)
-        self.lidar_front_half_angle = np.deg2rad(60)  # +/- 60 degrees for shaping
-        self.lidar_max_iters = 4        # see-through attempts per ray
-        self.lidar_eps_adv = 1e-3       # advance beyond ignored hit
-
-        # Will be populated after bodies exist
-        self.lidar_ignore_ids = set()
-
-        # Cache last scan metrics (used in reward)
-        self._last_lidar = None
-        self._last_lidar_min_dist = self.lidar_range
-        self._last_lidar_min_dist_front = self.lidar_range
-
-
-        obs_dim = 10 + (self.lidar_num_rays if self.use_lidar else 0)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
-
+        # Reward / avoidance tuning (non-LiDAR-specific params)
+        # --------------------------
         self.lidar_block_dist = 2.0
+        self.lidar_clear_margin = 0.20
+        self.lidar_escape_k = 4.0
+        self.escape_v_min = 0.05
 
-        self.lidar_angles = np.linspace(-np.pi, np.pi, self.lidar_num_rays, endpoint=False).astype(np.float32)
-
-        self.lidar_clear_margin = 0.20     # skin-to-skin margin required before reward starts
-        self.lidar_escape_k = 4.0          # magnitude of positive escape reward
-        self.escape_v_min = 0.05           # below this speed, treat as "not moving"
-
+        self.heading_cone_margin = np.deg2rad(10.0)
+        self.heading_escape_k = 2.0
+        self.heading_escape_scale = np.deg2rad(15.0)
 
         # --------------------------
-        # Space-mode toggle (hysteresis)
+        # Observation space
         # --------------------------
-        self.space_mode_enter = self.lidar_block_dist              # enter when motion clearance < this
-        self.space_mode_exit  = 3.0       # exit when motion clearance > this
-        self.space_mode_min_hold_steps = 10                        # optional: avoid flicker
-        self._space_mode_hold = 0
+        obs_dim = 10 + (int(self.lidar_num_rays) if getattr(self, "use_lidar", False) else 0)
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
-
-
-    def _update_space_mode(self):
-        """
-        Toggle self.space_mode using clearance in the motion cone with hysteresis.
-        Uses self._last_lidar_min_dist_motion (skin-to-skin distance in motion direction).
-        """
-        if (not getattr(self, "use_lidar", False)) or (self._last_lidar is None):
-            self.space_mode = False
-            self._space_mode_hold = 0
-            return
-
-        clear_motion = float(getattr(self, "_last_lidar_min_dist_motion", self.lidar_range))
-
-        # Optional hold timer to prevent flicker
-        if self._space_mode_hold > 0:
-            self._space_mode_hold -= 1
-            return
-
-        if (not self.space_mode) and (clear_motion < float(self.space_mode_enter)):
-            self.space_mode = True
-            self._space_mode_hold = int(self.space_mode_min_hold_steps)
-
-        elif self.space_mode and (clear_motion > float(self.space_mode_exit)):
-            self.space_mode = False
-            self._space_mode_hold = int(self.space_mode_min_hold_steps)
-
-
-
-        
-
-
-
-
-    def _ray_cast_ignore_ids(self, start, end, ignore_ids, max_iters=4, eps=1e-3):
-        """
-        Ray cast start->end. If it hits an ignored body, advance start slightly and retry.
-        Returns: (hit_fraction in [0,1], hit_body_id)
-        """
-        start = np.array(start, dtype=np.float32)
-        end   = np.array(end, dtype=np.float32)
-
-        dir_vec = end - start
-        dir_len = float(np.linalg.norm(dir_vec))
-        if dir_len < 1e-9:
-            return 1.0, -1
-
-        dir_unit = dir_vec / dir_len
-        cur_start = start.copy()
-
-        for _ in range(max_iters):
-            body_id, _, hit_frac, _, hit_pos = p.rayTest(cur_start.tolist(), end.tolist())[0]
-
-            # no hit
-            if body_id < 0 or hit_frac >= 1.0:
-                return 1.0, -1
-
-            # hit ignored -> see through
-            if body_id in ignore_ids:
-                hit_pos = np.array(hit_pos, dtype=np.float32)
-                cur_start = hit_pos + eps * dir_unit
-                if float(np.linalg.norm(end - cur_start)) < 1e-4:
-                    return 1.0, -1
-                continue
-
-            # valid hit
-            return float(hit_frac), int(body_id)
-
-        return 1.0, -1
-    
-    def _lidar_scan(self, robot_xy, robot_yaw):
-        """
-        Returns:
-        lidar: (N,) float32 in [0,1] (1.0 means no hit within range)
-        min_dist: min physical distance (0..range), range if none
-        min_dist_front: min distance in +/- front cone
-        """
-        N = self.lidar_num_rays
-        R = self.lidar_range
-        z0 = self.lidar_height
-
-        angles = np.linspace(-np.pi, np.pi, N, endpoint=False, dtype=np.float32)
-        start = np.array([robot_xy[0], robot_xy[1], z0], dtype=np.float32)
-
-        lidar = np.ones(N, dtype=np.float32)
-        ignore_ids = self.lidar_ignore_ids
-
-        for i, a in enumerate(angles):
-            aw = float(robot_yaw + a)
-            end = np.array([robot_xy[0] + R * np.cos(aw),
-                            robot_xy[1] + R * np.sin(aw),
-                            z0], dtype=np.float32)
-
-            frac, _ = self._ray_cast_ignore_ids(
-                start, end,
-                ignore_ids=ignore_ids,
-                max_iters=self.lidar_max_iters,
-                eps=self.lidar_eps_adv
-            )
-            lidar[i] = np.clip(frac, 0.0, 1.0)
-
-        dists = lidar * R
-        min_dist = float(np.min(dists))
-
-        front_mask = np.abs(angles) <= self.lidar_front_half_angle
-        min_dist_front = float(np.min(dists[front_mask])) if np.any(front_mask) else min_dist
-
-        return lidar, min_dist, min_dist_front
-
-
-    def compute_lidar_scan(self, robot_xy, robot_yaw):
-        """
-        Computes a 2D LiDAR scan in the plane at z=self.lidar_height.
-
-        Returns:
-        angles: (N,) radians in robot frame ([-pi, pi))
-        fracs:  (N,) hitFraction in [0,1], 1.0 => no hit within range
-        dists:  (N,) physical distance = fracs * range
-        hits:   (N,3) world hit points (end point if no hit)
-        min_dist: float, minimum distance across all rays
-        min_front: float, minimum distance in +/- front cone
-        """
-        N = self.lidar_num_rays
-        R = self.lidar_range
-        z0 = self.lidar_height
-
-        angles = np.linspace(-np.pi, np.pi, N, endpoint=False, dtype=np.float32)
-        start = np.array([robot_xy[0], robot_xy[1], z0], dtype=np.float32)
-
-        fracs = np.ones(N, dtype=np.float32)
-        hits = np.zeros((N, 3), dtype=np.float32)
-
-        ignore_ids = self.lidar_ignore_ids
-
-        for i, a in enumerate(angles):
-            aw = float(robot_yaw + float(a))
-            end = np.array([robot_xy[0] + R * np.cos(aw),
-                            robot_xy[1] + R * np.sin(aw),
-                            z0], dtype=np.float32)
-
-            frac, _ = self._ray_cast_ignore_ids(
-                start, end,
-                ignore_ids=ignore_ids,
-                max_iters=self.lidar_max_iters,
-                eps=self.lidar_eps_adv
-            )
-            frac = float(np.clip(frac, 0.0, 1.0))
-            fracs[i] = frac
-            hits[i, :] = start + frac * (end - start)  # end if frac==1.0
-
-        dists = fracs * R
-        min_dist = float(np.min(dists))
-
-        front_mask = np.abs(angles) <= float(self.lidar_front_half_angle)
-        min_front = float(np.min(dists[front_mask])) if np.any(front_mask) else min_dist
-
-        return angles, fracs, dists, hits, min_dist, min_front
-    
-
-    def visualize_avoid_envelope(self):
-        """
-        Visualize the envelope used by _lidar_heading_avoid_term():
-        - Rays with dist < d_block are 'blocked'
-        - Their penalty contribution is closeness * cos^2(delta)
-        """
-        if (not self.render_mode) or (not getattr(self, "use_lidar", False)):
-            return
-        if self._last_env_ob is None or self._last_lidar is None:
-            return
-
-        # Clear previous items
-        for lid in getattr(self, "_avoid_dbg_line_ids", []):
-            try:
-                p.removeUserDebugItem(lid)
-            except Exception:
-                pass
-        self._avoid_dbg_line_ids = []
-
-        if getattr(self, "_avoid_dbg_text_id", None) is not None:
-            try:
-                p.removeUserDebugItem(self._avoid_dbg_text_id)
-            except Exception:
-                pass
-            self._avoid_dbg_text_id = None
-
-        # Robot pose
-        base_state = self._last_env_ob[0]["robot_0"]["joint_state"]
-        robot_xy = np.array(base_state["position"][:2], dtype=np.float32)
-        robot_yaw = float(self.get_robot_yaw_wf())
-        start = [float(robot_xy[0]), float(robot_xy[1]), float(self.lidar_height)]
-
-        # Params
-        R = float(self.lidar_range)
-        d_block = float(getattr(self, "lidar_block_dist", 0.60))
-
-        # Motion heading (robot frame): forward only for this term (your function returns early if v<=0)
-        v = float(self.last_action_executed[0]) if hasattr(self, "last_action_executed") else 0.0
-        w = float(self.last_action_executed[1]) if hasattr(self, "last_action_executed") else 0.0
-        motion_heading = 0.0 if v >= 0.0 else float(np.pi)
-
-        # Compute blockedness and contribution per beam
-        dists = self._last_lidar.astype(np.float32) * R
-        closeness = np.clip((d_block - dists) / max(d_block, 1e-6), 0.0, 1.0)
-
-        delta = np.arctan2(np.sin(self.lidar_angles - motion_heading),
-                        np.cos(self.lidar_angles - motion_heading))
-        align = (np.cos(delta) ** 2).astype(np.float32)
-
-        contrib = closeness * align
-        align_mean = float(np.sum(contrib) / (float(np.sum(closeness)) + 1e-6))
-
-        # Get hit geometry for drawing
-        angles, fracs, dists_geom, hits, min_dist, min_front = self.compute_lidar_scan(robot_xy, robot_yaw)
-
-        # Draw motion heading arrow (white)
-        aw = robot_yaw + motion_heading
-        end_motion = [start[0] + R * float(np.cos(aw)),
-                    start[1] + R * float(np.sin(aw)),
-                    start[2]]
-        self._avoid_dbg_line_ids.append(
-            p.addUserDebugLine(start, end_motion, lineColorRGB=[1, 1, 1], lineWidth=3.0, lifeTime=0.0)
-        )
-
-        # Draw envelope rays:
-        # - only beams with closeness > 0 (within d_block)
-        # - color intensity represents contribution (contrib)
-        # - red = high contribution (strongly penalized)
-        # - yellow = medium contribution
-        # - blue = blocked but not aligned (low contribution)
-        for i in range(self.lidar_num_rays):
-            if float(closeness[i]) <= 1e-6:
-                continue
-
-            end = hits[i, :].tolist()
-            c = float(contrib[i])  # 0..1-ish
-
-            if c > 0.50:
-                color = [1.0, 0.0, 0.0]      # strong penalty contributor
-                width = 4.0
-            elif c > 0.20:
-                color = [1.0, 1.0, 0.0]      # medium
-                width = 3.0
-            else:
-                color = [0.2, 0.2, 1.0]      # blocked but not aligned
-                width = 2.5
-
-            self._avoid_dbg_line_ids.append(
-                p.addUserDebugLine(start, end, lineColorRGB=color, lineWidth=width, lifeTime=0.0)
-            )
-
-        # # HUD text
-        # txt = (
-        #     f"AVOID ENVELOPE (space_mode={bool(getattr(self,'space_mode',False))})\n"
-        #     f"d_block={d_block:.2f} | v={v:.2f} w={w:.2f}\n"
-        #     f"align_mean={align_mean:.3f} | max closeness={float(np.max(closeness)):.2f}"
-        # )
-        # self._avoid_dbg_text_id = p.addUserDebugText(
-        #     txt,
-        #     [start[0], start[1], start[2] + 0.60],
-        #     textColorRGB=[1, 1, 1],
-        #     textSize=1.2,
-        #     lifeTime=0.0
-    #)
-
-    
-    def visualize_lidar(self):
-        """
-        Debug visualization in PyBullet GUI.
-        Draws LiDAR rays from robot position with colors based on hit distance.
-        Ignores robot base + table via lidar_ignore_ids.
-
-        Call from step() when render_mode is enabled.
-        """
-        if (not self.render_mode) or (not self.lidar_debug) or (not self.use_lidar):
-            return
-        if self._last_env_ob is None:
-            return
-
-        # Clear previous debug items
-        for lid in self._lidar_debug_line_ids:
-            try:
-                p.removeUserDebugItem(lid)
-            except Exception:
-                pass
-        self._lidar_debug_line_ids.clear()
-
-        if self._lidar_debug_text_id is not None:
-            try:
-                p.removeUserDebugItem(self._lidar_debug_text_id)
-            except Exception:
-                pass
-            self._lidar_debug_text_id = None
-
-        # Current robot pose
-        base_state = self._last_env_ob[0]["robot_0"]["joint_state"]
-        robot_xy = np.array(base_state["position"][:2], dtype=np.float32)
-        robot_yaw = self.get_robot_yaw_wf()
-        start = [float(robot_xy[0]), float(robot_xy[1]), float(self.lidar_height)]
-
-        angles, fracs, dists, hits, min_dist, min_front = self.compute_lidar_scan(robot_xy, robot_yaw)
-
-        # Draw rays
-        for i in range(self.lidar_num_rays):
-            end = hits[i, :].tolist()
-            dist = float(dists[i])
-            frac = float(fracs[i])
-            in_front = abs(float(angles[i])) <= float(self.lidar_front_half_angle)
-
-            # Color scheme:
-            # - no hit => green
-            # - close hit => red
-            # - mid hit => orange
-            if frac >= 0.999:
-                color = [0.0, 1.0, 0.0]
-            else:
-                if dist < 0.30:
-                    color = [1.0, 0.0, 0.0]
-                else:
-                    color = [1.0, 0.6, 0.0]
-
-            # Optional: front-cone tint to distinguish sector
-            if in_front and frac < 0.999:
-                color = [0.2, 0.2, 1.0]
-
-            line_id = p.addUserDebugLine(
-                start,
-                end,
-                lineColorRGB=color,
-                lineWidth=1.5,
-                lifeTime=0.0
-            )
-            self._lidar_debug_line_ids.append(line_id)
-
-        # Draw a text label above robot
-        txt = f"LiDAR min={min_dist:.3f} | front min={min_front:.3f} | ignore={list(self.lidar_ignore_ids)}"
-        self._lidar_debug_text_id = p.addUserDebugText(
-            txt,
-            [start[0], start[1], start[2] + 0.35],
-            textColorRGB=[1, 1, 1],
-            textSize=1.2,
-            lifeTime=0.0
-        )
-
-
-    
-    def closest_point_on_rect(self, point, rect_center, rect_extents):
-        """
-        Closest point on an axis-aligned rectangle (AABB) in 2D.
-        rect_center: (2,)
-        rect_extents: (2,) half-sizes
-        """
-        rect_min = rect_center - rect_extents
-        rect_max = rect_center + rect_extents
-        return np.minimum(np.maximum(point, rect_min), rect_max)
 
         
         
@@ -545,32 +195,6 @@ class AlbertTableEnv(gym.Env):
         return raw_yaw - (0.5 * np.pi)
     
 
-    def get_surface_dist_to_rect(self, point, rect_center, rect_extents, radius=0.0):
-        """
-        Returns distance from the ROBOT SURFACE (circle) to the RECTANGLE SURFACE.
-        Positive = Safe.
-        Negative = Crashed/Penetrating.
-        """
-        # 1. Get vector from center to point
-        diff = np.abs(point - rect_center)
-        
-        # 2. distance from box edge to point (ignoring radius for a moment)
-        outer_dist = np.maximum(diff - rect_extents, 0.0)
-        dist_center_to_wall = np.linalg.norm(outer_dist)
-
-        # 3. Check if we are physically inside the box rectangle (center is inside)
-        #    If outer_dist is all zeros, the center is inside the box.
-        #    (This handles the rare case where the center teleports inside)
-        is_center_inside = (outer_dist == 0).all()
-        
-        if is_center_inside:
-            # Deep penetration logic (simplified)
-            return -1.0 # Just return a collision value
-
-        # 4. Subtract Robot Radius to get "Skin-to-Skin" distance
-        surface_dist = dist_center_to_wall - radius
-        
-        return surface_dist
     
 
     def wrap_angle_bidirectional(self, ang: float) -> float:
@@ -604,8 +228,169 @@ class AlbertTableEnv(gym.Env):
         return float(np.min(clear[mask]))
     
 
+    def _motion_dir_angle(self) -> float:
+        v = float(self.last_action_executed[0]) if hasattr(self, "last_action_executed") else 0.0
+        yaw = float(self.get_robot_yaw_wf())
+        return wrap_angle(yaw + (np.pi if v < 0.0 else 0.0))
+    
+    def _motion_clearance(self) -> float:
+        # returns skin-to-skin clearance in meters along motion direction cone
+        center = self._motion_dir_angle()
+        return self._min_dist_in_cone(center_angle=center, half_angle=float(self.lidar_front_half_angle))
+    
+
+    def _get_obstacle_envelope_rf(self):
+        """
+        Returns obstacle cone in ROBOT frame using:
+        - contiguous hit cluster on circular LiDAR ring
+        - +1 padding beam on each side (wrap-around)
+
+        Output (or None if no hit):
+        center_rf: float in [-pi, pi]
+        half_rf:   float >= 0
+        obs_dist:  float, center-to-hit distance (meters) for the seed/closest hit
+        clearance: float, skin-to-skin (meters) = obs_dist - robot_radius
+        """
+        if (not getattr(self, "use_lidar", False)) or (self._last_lidar is None):
+            return None
+
+        N = int(self.lidar_num_rays)
+        R = float(self.lidar_range)
+        hit_mask = (self._last_lidar < 0.999)
+
+        if not np.any(hit_mask):
+            return None
+
+        # Distances (center-to-hit)
+        dists_center = self._last_lidar.astype(np.float32) * R
+        hit_idxs = np.where(hit_mask)[0]
+
+        # Seed = closest hit
+        i_seed = int(hit_idxs[np.argmin(dists_center[hit_idxs])])
+
+        def prev_i(i): return (i - 1) % N
+        def next_i(i): return (i + 1) % N
+
+        # Expand contiguous cluster on circular ring
+        i_left = i_seed
+        while hit_mask[prev_i(i_left)] and prev_i(i_left) != i_seed:
+            i_left = prev_i(i_left)
+
+        i_right = i_seed
+        while hit_mask[next_i(i_right)] and next_i(i_right) != i_seed:
+            i_right = next_i(i_right)
+
+        # If every ray hits, you don't really have a meaningful "envelope"
+        if np.all(hit_mask):
+            return None
+
+        # Padding beams: one outside cluster on each side
+        pad_left = prev_i(i_left)
+        pad_right = next_i(i_right)
+
+        # Ensure padding beams are actually outside (walk outward if necessary)
+        steps = 0
+        while hit_mask[pad_left] and steps < N:
+            pad_left = prev_i(pad_left)
+            steps += 1
+
+        steps = 0
+        while hit_mask[pad_right] and steps < N:
+            pad_right = next_i(pad_right)
+            steps += 1
+
+        # Boundary angles in robot frame come directly from padded indices
+        ang_L = float(self.lidar_angles[pad_left])
+        ang_R = float(self.lidar_angles[pad_right])
+
+        # Define the cone as the shortest arc from ang_R to ang_L
+        dtheta = float(np.arctan2(np.sin(ang_L - ang_R), np.cos(ang_L - ang_R)))
+        half = 0.5 * abs(dtheta)
+        center = float(np.arctan2(np.sin(ang_R + 0.5 * dtheta), np.cos(ang_R + 0.5 * dtheta)))
+
+        obs_dist = float(dists_center[i_seed])
+        clearance = float(obs_dist - float(self.robot_radius))
+
+        return center, half, obs_dist, clearance
+
+        
 
 
+    def visualize_robot_circle(
+        self,
+        radius: float | None = None,
+        *,
+        z: float | None = None,
+        num_segments: int = 48,
+        color=(0.0, 1.0, 1.0),
+        line_width: float = 2.0,
+        life_time: float = 0.0,
+        clear_previous: bool = True,
+    ):
+        """
+        Draw a circle around the robot center in the XY plane for debugging.
+
+        Assumes:
+        - self.render_mode exists (truthy when GUI/debug drawing is desired)
+        - self._last_env_ob contains robot pose like your other debug functions
+        - optional: self.robot_radius (used if radius is None)
+
+        Parameters:
+        radius: Circle radius in meters. Defaults to self.robot_radius if available, else 0.25.
+        z: Height to draw the circle at. Defaults to self.lidar_height if available, else robot base z.
+        num_segments: Polyline resolution.
+        color: RGB tuple/list in [0,1].
+        line_width: Debug line width.
+        life_time: 0.0 = persistent (until removed), >0 seconds = auto-expire.
+        clear_previous: If True, removes previously drawn circle segments first.
+        """
+        if not getattr(self, "render_mode", False):
+            return
+        if getattr(self, "_last_env_ob", None) is None:
+            return
+
+        # --- Clear prior circle lines
+        if clear_previous:
+            for lid in getattr(self, "_robot_circle_dbg_line_ids", []):
+                try:
+                    p.removeUserDebugItem(lid)
+                except Exception:
+                    pass
+            self._robot_circle_dbg_line_ids = []
+
+        base_state = self._last_env_ob[0]["robot_0"]["joint_state"]
+        pos = base_state["position"]
+        cx, cy = float(pos[0]), float(pos[1])
+        base_z = float(pos[2]) if len(pos) > 2 else 0.0
+
+        if radius is None:
+            radius = float(getattr(self, "robot_radius", 0.25))
+
+        if z is None:
+            # Prefer lidar height (consistent with your other debug visuals), else base_z
+            z = float(getattr(self, "lidar_height", base_z))
+
+        n = max(8, int(num_segments))
+        two_pi = 2.0 * np.pi
+
+        # Build and draw polyline circle
+        line_ids = getattr(self, "_robot_circle_dbg_line_ids", [])
+        for i in range(n):
+            a0 = two_pi * (i / n)
+            a1 = two_pi * ((i + 1) / n)
+
+            p0 = [cx + radius * float(np.cos(a0)), cy + radius * float(np.sin(a0)), z]
+            p1 = [cx + radius * float(np.cos(a1)), cy + radius * float(np.sin(a1)), z]
+
+            lid = p.addUserDebugLine(
+                p0, p1,
+                lineColorRGB=list(color),
+                lineWidth=float(line_width),
+                lifeTime=float(life_time),
+            )
+            line_ids.append(lid)
+
+        self._robot_circle_dbg_line_ids = line_ids
 
 
 
@@ -640,27 +425,20 @@ class AlbertTableEnv(gym.Env):
         ], dtype=np.float32)
 
         if self.use_lidar:
-            robot_xy = np.array(base_state["position"][:2], dtype=np.float32)
-            lidar, min_dist, min_dist_front = self._lidar_scan(robot_xy, robot_yaw)
-
-            # store for reward/termination if you want
-            # store for reward/termination
-            self._last_lidar = lidar
-            self._last_lidar_min_dist = min_dist
-            self._last_lidar_min_dist_front = min_dist_front
-
-
-            return np.concatenate([obs_core, lidar.astype(np.float32)], axis=0)
+            # use cached lidar; if not available, fill with "no hit"
+            if self._last_lidar is None:
+                lidar = np.ones(self.lidar_num_rays, dtype=np.float32)
+            else:
+                lidar = self._last_lidar.astype(np.float32)
+            return np.concatenate([obs_core, lidar], axis=0)
 
         return obs_core
-    
+
   
-
-
     # ---------------------------------------------------------------------
     #                            REWARD
     # ---------------------------------------------------------------------
-    def compute_reward(self, dist, prev_dist, heading_error_bi, heading_diff):
+    def compute_reward(self, dist, prev_dist, heading_error_bi):
         """
         Computes the shaping reward based on:
             - table progress
@@ -700,13 +478,6 @@ class AlbertTableEnv(gym.Env):
         # ---------------------------------------------------------
         table_xy, _, tv_xy, _ = self.sim.get_table_state_world()
         goal_xy = self.goal[:2]
-        Fh_xy = self.sim.last_Fh_xy
-        Fr_xy = self.sim.last_F_xy
-
-        #collaboration_reward = self.compute_collaboration_reward(dir_to_goal)
-
-        # set to zero for now as motion_reward might already be the collaboration reward you want
-        collaboration_reward = 0.0
 
 
         base_state = self._last_env_ob[0]["robot_0"]["joint_state"]
@@ -720,21 +491,11 @@ class AlbertTableEnv(gym.Env):
         # Option 2: BYPASS SHAPING
         # Reward making obstacle move out of the forward cone when blocked.
         # ---------------------------------------------------------
-        avoid_pen, avoid_dbg = self._lidar_heading_avoid_term()
+        # ---------------------------------------------------------
+        # LiDAR-based bypass shaping (bidirectional)
+        # ---------------------------------------------------------
 
-        # if self.step_count % 10 == 0:
-        #     print("heading penalty", avoid_pen)
-        #     print("space reward", space_reward)
-
-        space_reward, space_dbg = self._escape_heading_reward()
-
-        bypass_reward = avoid_pen + space_reward
-
-        # if self.step_count % 10 == 0:
-        #     print("space_reward", space_reward)
-        #     print("avoid pen", avoid_pen)
-
-
+        bypass_reward = self._avoidance_shaping()
 
         # final reward
         total_reward = (
@@ -744,164 +505,141 @@ class AlbertTableEnv(gym.Env):
             heading_penalty + obstacle_penalty + bypass_reward
         )
 
+        # if self.step_count % 10 == 0:
+        #     print(f"total: {total_reward} | progress: {progress_reward} | motion: {motion_reward} | distance: {distance_penalty} | heading:{heading_penalty} |  obstacle: {obstacle_penalty} |bypass: {bypass_reward}")
+
+
         
 
         return total_reward, progress_reward, motion_reward, distance_penalty, heading_penalty, obstacle_penalty, bypass_reward, is_crash
     
 
-    def _calc_obstacle_penalty(self, robot_pos):
-        ROBOT_RADIUS = float(self.robot_radius)
-
-        if self.obstacle_pos is None or self.obstacle_extents is None:
+    def _calc_obstacle_penalty(self, _robot_pos_unused):
+        """
+        Calculates static repulsion based purely on LiDAR observation.
+        
+        Args:
+            _robot_pos_unused: Kept for signature compatibility, but ignored.
+            
+        Returns:
+            (float) penalty, (bool) is_crash
+        """
+        # 1. Safety / Initialization Checks
+        if (not getattr(self, "use_lidar", False)) or (self._last_lidar is None):
             return 0.0, False
 
-        rect_min = self.obstacle_pos - self.obstacle_extents
-        rect_max = self.obstacle_pos + self.obstacle_extents
-        closest = np.minimum(np.maximum(robot_pos, rect_min), rect_max)
-
-        vec = closest - robot_pos
-        dist_center_to_wall = float(np.linalg.norm(vec))
-
-        # Surface (skin-to-skin) distance
-        if dist_center_to_wall < 1e-9:
-            dist_surface = -1.0
-        else:
-            dist_surface = dist_center_to_wall - ROBOT_RADIUS
-
-        # --------------------------
-        # 1) Crash condition
-        # --------------------------
-        crash_dist = 0.10  # meters; your current threshold
-        if dist_surface <= crash_dist:
-            # print(f"[COLISSION] AT STEP {self.step_count}")
-            return -1.0, False
-
-        # --------------------------
-        # 2) Smooth clearance penalty
-        # --------------------------
-        # Start penalizing before crash to discourage "corner clipping"
-        d_safe = 1.0  # meters; tune (0.25–0.50 is typical)
-        if dist_surface < d_safe:
-            # normalized violation in [0,1]
-            x = (d_safe - dist_surface) / (d_safe - crash_dist + 1e-6)
-            x = float(np.clip(x, 0.0, 1.0))
-
-            # quadratic penalty (0 at d_safe, -k at crash_dist)
-            k_clear = 2.0  # tune relative to your other reward terms
-            penalty = -k_clear * (x ** 2)
-
-            return float(penalty), False
-
-        return 0.0, False
-
+        # 2. Get the closest object detected by any ray
+        # self._last_lidar values are in [0, 1], representing [0, max_range]
+        raw_min_norm = np.min(self._last_lidar)
         
+        # If the closest ray is at max range (approx 1.0), we are safe.
+        if raw_min_norm >= 0.999:
+            return 0.0, False
 
-    def _lidar_heading_avoid_term(self):
-        """
-        Secondary guardrail: penalize pushing forward into blocked directions,
-        but do not incentivize freezing. Only active when space_mode is ON.
-        """
+        # 3. Convert to Real Meters
+        # geometric distance from Lidar center to hit point
+        dist_to_hit = raw_min_norm * float(self.lidar_range)
+        
+        # 4. Calculate Skin-to-Skin Clearance
+        # We subtract the robot radius to get the distance from the robot's "skin"
+        clearance = dist_to_hit - float(self.robot_radius)
+
+        # -------------------------------
+        # TUNING PARAMETERS
+        # -------------------------------
+        CRASH_DIST = 0.0   # Meters. Closer than this = 'Crash' zone. Also tried 0.2 larger crash_dist did not seem to matter or robot, but need to connect this with lidar andactual distance
+        SAFE_DIST  = 0.2   # Meters. The "uncomfortable" zone.
+        
+        # Penalties
+        P_CRASH    = -5.0  # Heavy constant penalty for touching # was 7.0
+        K_STATIC   = 5.0    # Scaling factor for the approach (shaping)
+
+        # 5. Check Crash Zone (The "Hot Stove")
+        # We return is_crash=False so the episode continues, allowing the agent
+        # to learn how to back away from the penalty source.
+        if clearance <= CRASH_DIST:
+            print(f"[CRASH], clearance: {clearance}")
+            return P_CRASH, False 
+        
+        #if self.step_count % 10 == 0:
+            #print("clearance in obstacle penalty", clearance)
+
+        # Smooth repulsion inside SAFE_DIST (continuous gradient)
+        if clearance < SAFE_DIST:
+            # clearance in (CRASH_DIST, SAFE_DIST)
+            x = (SAFE_DIST - clearance) / max(SAFE_DIST - CRASH_DIST, 1e-6)  # 0..1
+            penalty = -K_STATIC * (x ** 2)   # quadratic ramp
+            return float(penalty), False
+        
+        return 0.0, False
+    
+    def _avoidance_shaping(self) -> float:
         if (not getattr(self, "use_lidar", False)) or (self._last_lidar is None):
-            return 0.0, {}
+            return 0.0
 
-        # Only apply when we're in "blocked" mode (near obstacle)
-        if not getattr(self, "space_mode", False):
-            return 0.0, {"active": False, "reason": "space_mode_off"}
+        v = float(self.last_action_executed[0]) if hasattr(self, "last_action_executed") else 0.0
+        if abs(v) < float(self.escape_v_min):
+            return 0.0
 
-        v = float(self.last_action_executed[0])
-        w = float(self.last_action_executed[1])
+        envelope = self._get_obstacle_envelope_rf()
+        if envelope is None:
+            return 0.0
 
-        # Backing up is allowed; don't penalize it
-        if v <= 0.0:
-            return 0.0, {"active": False, "reason": "v_nonpositive"}
-
-        # Distances in meters
-        dists = self._last_lidar.astype(np.float32) * float(self.lidar_range)
-
-        d_block = float(getattr(self, "lidar_block_dist", 0.60))
-
-        closeness = np.clip((d_block - dists) / d_block, 0.0, 1.0)
+        cone_center_rf, cone_half_rf, obs_dist, clearance = envelope
+        travel_rf = 0.0 if v >= 0.0 else float(np.pi)
 
         # if self.step_count % 10 == 0:
-        #     print("closeness", closeness)
-
-        if float(np.max(closeness)) <= 1e-6:
-            return 0.0, {"active": False, "reason": "no_blocked"}
-
-        # Motion heading for forward is 0
-        v = float(self.last_action_executed[0])
-        motion_heading = 0.0 if v >= 0.0 else np.pi
+        #     print("clearance in avoidance shaping", clearance)
 
 
-        delta = np.arctan2(np.sin(self.lidar_angles - motion_heading),
-                        np.cos(self.lidar_angles - motion_heading))
+        # --------------------------
+        # NO inflation: use raw LiDAR cone half-angle
+        # --------------------------
+        half = float(cone_half_rf)
 
-        align = (np.cos(delta) ** 2).astype(np.float32)
+        # Angular difference to cone center
+        delta = float(np.arctan2(np.sin(travel_rf - cone_center_rf), np.cos(travel_rf - cone_center_rf)))
+        ad = abs(delta)
 
-        align_mean = float(np.sum(closeness * align) / (np.sum(closeness) + 1e-6))
+        # Proximity scaling (skin-to-skin) -- unchanged
+        d_enter = float(getattr(self, "lidar_block_dist", 2.0))
+        d_safe  = float(getattr(self, "lidar_clear_margin", 0.20))
+        prox = (d_enter - float(clearance)) / max(d_enter - d_safe, 1e-6)
+        prox = float(np.clip(prox, 0.0, 1.0))
 
-        # Reduce penalty when turning (turning is how you open space)
-        # turn_scale -> 0 when |w| large, 1 when |w| small
-        w_turn = 0.6  # rad/s scale
-        turn_scale = float(np.clip(1.0 - abs(w) / w_turn, 0.0, 1.0))
+        if prox <= 0.0:
+            return 0.0
 
-        w_align = 2.0  # keep small; this is now a secondary term
-        term = -w_align * align_mean * turn_scale
+        # Bonus band outside the cone (default 30 degrees)
+        bonus_band = float(getattr(self, "avoid_bonus_band", np.deg2rad(30.0)))
+
+        inside_cone = (ad <= half)
+        in_bonus_band = (ad > half) and (ad <= (half + bonus_band))
+
+        k_in  = 6.0 # 6.0 # also tried 10, 3
+        k_out = 2.0 # also tried 3 see 1111
+
+        # How far past the cone boundary we are (0 at boundary, 1 at outer edge of bonus band)
+        outside_depth = (ad - half) / max(bonus_band, 1e-6)
+        outside_depth = float(np.clip(outside_depth, 0.0, 1.0))
+
+        # Optional shaping curve: emphasize steering further away from boundary
+        outside_gain = outside_depth   # or keep linear: outside_gain = outside_depth
 
 
-        return term, {"active": True, "align_mean": align_mean, "turn_scale": turn_scale, "v": v, "w": w}
-    
+        if inside_cone:
+            #print(f"inside cone penalty: {-k_in * (prox ** 2)}")
+            return -k_in * (prox ** 2)
+        elif in_bonus_band:
+            #print(f"outside cone bonus: {+k_out * ((1.2 - prox))}")
+            return +k_out * ((1.0 - prox)) * outside_gain
+        else:
+            return 0.0
 
-    def _escape_heading_reward(self):
-        """
-        Positive counterpart to the avoid penalty.
 
-        Active only in space_mode (blocked mode).
-        Rewards choosing a motion direction with clearance (in the motion cone),
-        scaled by |v| so it doesn't reward freezing.
-        """
-        if (not getattr(self, "use_lidar", False)) or (self._last_lidar is None):
-            return 0.0, {"active": False, "reason": "no_lidar"}
-    
 
-        if not getattr(self, "space_mode", False):
-            return 0.0, {"active": False, "reason": "space_mode_off"}
 
-        # Need last_action_executed set
-        if not hasattr(self, "last_action_executed"):
-            return 0.0, {"active": False, "reason": "no_action"}
 
-        v = float(self.last_action_executed[0])
-
-        v_min = float(getattr(self, "escape_v_min", 0.05))
-        if abs(v) < v_min:
-            return 0.0, {"active": False, "reason": "v_too_small", "v": v}
-
-        # Motion heading in robot frame
-        motion_heading = 0.0 if v >= 0.0 else float(np.pi)
-
-        # Clearance in that cone (skin-to-skin) — uses your existing cone helper
-        motion_clear = self._min_dist_in_cone(
-            center_angle=motion_heading,
-            half_angle=float(self.lidar_front_half_angle)
-        )
-
-        margin = float(getattr(self, "lidar_clear_margin", 0.20))
-        good = max(0.0, float(motion_clear) - margin)
-
-        k = float(getattr(self, "lidar_escape_k", 2.0))
-        reward = float(k * abs(v) * good)
-
-        return reward, {
-            "active": True,
-            "v": v,
-            "motion_heading": motion_heading,
-            "motion_clear": float(motion_clear),
-            "margin": margin,
-            "good": good,
-            "k": k,
-            "reward": reward
-        }
 
 
     def apply_human_feedback(self, action, Fh_world_xy):
@@ -1041,21 +779,14 @@ class AlbertTableEnv(gym.Env):
         self._last_env_ob = ob
 
         self.sim.enforce_rigid_arm()
-        obs = self._get_obs()  # updates self._last_lidar for THIS step
-
-        # Compute clearance in the direction of motion (forward/backward)
-        if self.use_lidar and (self._last_lidar is not None):
-            v_exec = float(self.last_action_executed[0])
-            motion_heading = 0.0 if v_exec >= 0.0 else np.pi
-            self._last_lidar_min_dist_motion = self._min_dist_in_cone(
-                center_angle=motion_heading,
-                half_angle=self.lidar_front_half_angle
-            )
-        else:
-            self._last_lidar_min_dist_motion = float(self.lidar_range)
 
         
-        self._update_space_mode()
+        # Update sensing caches here (one scan per step)
+        self._update_lidar_caches()
+
+
+        # Build obs once and return it
+        obs = self._get_obs()        
 
         # -------------------------------------------------------
         # 5) GOAL DISTANCE + PROGRESS-STALL BOOKKEEPING + REWARD
@@ -1067,12 +798,11 @@ class AlbertTableEnv(gym.Env):
 
 
         heading_error_bi, heading_error = self.compute_robot_heading_error(dx_t, dy_t, robot_yaw)
-        heading_diff = wrap_angle(table_yaw - robot_yaw)
 
 
 
         reward, progress_reward, motion_reward, distance_penalty, heading_penalty, obstacle_penalty, bypass_reward, is_crash = (
-            self.compute_reward(dist, self.prev_dist, heading_error_bi, heading_diff)
+            self.compute_reward(dist, self.prev_dist, heading_error_bi)
         )
 
         # Update prev_dist AFTER computing reward
@@ -1084,7 +814,7 @@ class AlbertTableEnv(gym.Env):
         terminated = dist < 0.4
         if terminated:
             print(f"[CHECK] Reached goal at step: {self.step_count}")
-            reward += 100
+            reward += 150
 
         if is_crash:
             print(f"[COLLISION] Hit obstacle at step: {self.step_count}")
@@ -1113,8 +843,11 @@ class AlbertTableEnv(gym.Env):
             "bypass_reward": bypass_reward,
         }
 
-        if self.render and (self.step_count % 10) == 0: 
+        if self.render and (self.step_count % 75) == 0: 
             self.visualize_avoid_envelope()
+            self.visualize_robot_circle()
+            #self.visualize_lidar()
+            #print(self._last_lidar * self.lidar_range)
 
 
         
@@ -1169,7 +902,6 @@ class AlbertTableEnv(gym.Env):
             # !!! CONDITIONAL OBSTACLE SPAWNING !!!
             # ---------------------------------------------------
             if self.use_obstacles:
-                from rl_env.obstacles_and_sensing import MapMaker
                 mm = MapMaker()
                 mm.create_map_1()  # Spawns the wall
 
@@ -1210,18 +942,11 @@ class AlbertTableEnv(gym.Env):
                 jid = self.sim.get_joint_id_by_name(self.sim.albert_id, wheel_joint)
                 p.resetJointState(self.sim.albert_id, jid, 0.0, 0.0)
 
-
-          
-            
-
             # -----------------------------
             # Reset table base
             # -----------------------------
             self.sim.reset_table()   # SAFE: table_id guaranteed to exist
          
-
-
-
             # # -----------------------------
             # # Resolve any collisions
             # # -----------------------------
@@ -1268,21 +993,18 @@ class AlbertTableEnv(gym.Env):
         self.prev_obs_dist_surface = None
         self.prev_obs_bearing = None
 
-        # LiDAR ignore list: ignore robot base and table
         if self.use_lidar:
             self.lidar_ignore_ids = {self.sim.albert_id, self.sim.table_id}
 
-        self.space_mode = False
-        self.prev_motion_clear = self.lidar_range
-        self._last_lidar_min_dist_motion = self.lidar_range
 
+        # Initialize last_action_executed so motion clearance is well-defined
+        self.last_action_executed = np.array([0.0, 0.0], dtype=np.float32)
 
+        # Compute first scan caches, then return observation
+        self._update_lidar_caches()
+        obs = self._get_obs()
 
-
-
-
-
-        return self._get_obs(), {}
+        return obs, {}
 
 
     # ---------------------------------------------------------------------
@@ -1320,9 +1042,3 @@ class AlbertTableEnv(gym.Env):
         self.sim.env.close()
         print("Environment closed.")
 
-
-    def _debug_arm(self):
-        joints = [p.getJointState(self.sim.albert_id, j)[0] for j in self.sim.arm_joint_indices]
-
-        print(f"\n==== arm pose at step: {self.step_count} ====")
-        print("Joint angles:", np.round(joints, 3))
