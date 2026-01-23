@@ -45,11 +45,10 @@ import pybullet as p
 from controllers.impedance_sim import AlbertTableImpedanceSim, wrap_angle
 
 from rl_env.obstacles_and_sensing import MapMaker
-from rl_env.obstacles_and_sensing import LidarMixin
 
 
 
-class AlbertTableEnv(LidarMixin, gym.Env):
+class AlbertTableEnv(gym.Env):
     """
     Simplified Gymnasium environment focusing on table motion + robot/table heading alignment.
 
@@ -72,20 +71,9 @@ class AlbertTableEnv(LidarMixin, gym.Env):
     def __init__(
         self,
         render: bool = False,
-        max_steps: int = 1200,
+        max_steps: int = 1000,
         use_obstacles: bool = False,
         goals=None,
-        # --------------------------
-        # LiDAR configuration (forwarded to LidarMixin)
-        # --------------------------
-        use_lidar: bool = True,
-        lidar_num_rays: int = 36,
-        lidar_range: float = 3.0,
-        lidar_height: float = 0.25,
-        lidar_front_half_angle: float = np.deg2rad(60),
-        lidar_max_iters: int = 4,
-        lidar_eps_adv: float = 1e-3,
-        lidar_debug: bool = False,
     ):
         """
         Parameters
@@ -98,25 +86,14 @@ class AlbertTableEnv(LidarMixin, gym.Env):
             Whether to spawn obstacles (MapMaker) on first episode.
         goals : list of (float, float)
             List of goal positions; one is sampled each reset().
-
-        LiDAR params are forwarded to LidarMixin.__init__().
         """
-
-        # IMPORTANT: cooperative init so LidarMixin (and gym.Env) initialize properly
-        super().__init__(
-            use_lidar=use_lidar,
-            lidar_num_rays=lidar_num_rays,
-            lidar_range=lidar_range,
-            lidar_height=lidar_height,
-            lidar_front_half_angle=lidar_front_half_angle,
-            lidar_max_iters=lidar_max_iters,
-            lidar_eps_adv=lidar_eps_adv,
-            lidar_debug=lidar_debug,
-        )
 
         # --------------------------
         # Core env bookkeeping
         # --------------------------
+
+        super().__init__()
+
         self.render_mode = render
         self.max_steps = max_steps
         self.step_count = 0
@@ -156,27 +133,56 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         # Robot footprint used by avoidance logic
         self.robot_radius = 0.5  # set to your base footprint radius
 
+      
         # --------------------------
-        # Reward / avoidance tuning (non-LiDAR-specific params)
-        # --------------------------
-        self.lidar_block_dist = 2.0
-        self.lidar_clear_margin = 0.20
-        self.lidar_escape_k = 4.0
-        self.escape_v_min = 0.05
-
-        self.heading_cone_margin = np.deg2rad(10.0)
-        self.heading_escape_k = 2.0
-        self.heading_escape_scale = np.deg2rad(15.0)
-
-        # --------------------------
-        # Observation space
-        # --------------------------
-        obs_dim = 10 + (int(self.lidar_num_rays) if getattr(self, "use_lidar", False) else 0)
+        obs_dim = 10 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
-
-
         
+
+        # --------------------------
+        # Obstacle penalties (PyBullet-based, robot-only)
+        # --------------------------
+        self.obstacle_ids: list[int] = []  # filled when MapMaker spawns obstacles
+
+        # Distance band for smooth proximity penalty (meters)
+        self.obs_d_enter = 1.0     # start penalizing inside this distance
+        self.obs_d_safe  = 0.2    # near-contact zone (strong penalty region)
+        self.obs_query_dist = 3.0  # getClosestPoints query radius (>= obs_d_enter)
+
+        # Penalty magnitudes
+        self.obs_contact_penalty = 5.0   # per-step penalty when in contact
+        self.obs_impact_penalty  = 0.0   # one-time penalty when contact starts
+        self.obs_prox_k          = 3.0    # proximity penalty scale (quadratic)
+        self.obs_approach_k      = 0.0    # penalize moving closer (delta distance)
+
+        # Memory for penalties
+        self.prev_contact = False
+        self.prev_d_obs = None
+
+        # --------------------------
+        # Reward hyperparameters (loggable)
+        # --------------------------
+        self.kpr = 600.0     # progress reward gain
+        self.kmr = 2.0       # motion reward gain
+        self.whp = 3.5       # heading penalty gain
+        self.dist_div = 10.0 # distance penalty divisor
+
+        # Termination / success shaping (loggable)
+        self.goal_threshold = 0.4
+        self.goal_bonus = 100.0
+
+        # --------------------------
+        # Admittance hyperparameters (loggable)
+        # --------------------------
+        self.adm_gain_lin = 0.5 / 40.0
+        self.adm_gain_ang = 1.0 / 40.0
+        self.adm_deadzone = 1.0  # N (currently unused in code)
+        self.adm_v_clip = 1.0
+        self.adm_w_clip = 1.5
+
+
+
         
     def get_robot_yaw_wf(self):
         """
@@ -195,8 +201,6 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         return raw_yaw - (0.5 * np.pi)
     
 
-    
-
     def wrap_angle_bidirectional(self, ang: float) -> float:
         """
         Fold an angle so that directions separated by pi are treated as equivalent.
@@ -212,190 +216,13 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         return float(a)
     
 
-    def _min_dist_in_cone(self, center_angle, half_angle):
-        if self._last_lidar is None:
-            return float(self.lidar_range) - float(self.robot_radius)
-
-        dists = self._last_lidar.astype(np.float32) * float(self.lidar_range)
-        clear = dists - float(self.robot_radius)
-
-        delta = np.arctan2(np.sin(self.lidar_angles - center_angle),
-                        np.cos(self.lidar_angles - center_angle))
-        mask = np.abs(delta) <= float(half_angle)
-        if not np.any(mask):
-            return float(self.lidar_range) - float(self.robot_radius)
-
-        return float(np.min(clear[mask]))
-    
-
     def _motion_dir_angle(self) -> float:
         v = float(self.last_action_executed[0]) if hasattr(self, "last_action_executed") else 0.0
         yaw = float(self.get_robot_yaw_wf())
         return wrap_angle(yaw + (np.pi if v < 0.0 else 0.0))
     
-    def _motion_clearance(self) -> float:
-        # returns skin-to-skin clearance in meters along motion direction cone
-        center = self._motion_dir_angle()
-        return self._min_dist_in_cone(center_angle=center, half_angle=float(self.lidar_front_half_angle))
-    
 
-    def _get_obstacle_envelope_rf(self):
-        """
-        Returns obstacle cone in ROBOT frame using:
-        - contiguous hit cluster on circular LiDAR ring
-        - +1 padding beam on each side (wrap-around)
-
-        Output (or None if no hit):
-        center_rf: float in [-pi, pi]
-        half_rf:   float >= 0
-        obs_dist:  float, center-to-hit distance (meters) for the seed/closest hit
-        clearance: float, skin-to-skin (meters) = obs_dist - robot_radius
-        """
-        if (not getattr(self, "use_lidar", False)) or (self._last_lidar is None):
-            return None
-
-        N = int(self.lidar_num_rays)
-        R = float(self.lidar_range)
-        hit_mask = (self._last_lidar < 0.999)
-
-        if not np.any(hit_mask):
-            return None
-
-        # Distances (center-to-hit)
-        dists_center = self._last_lidar.astype(np.float32) * R
-        hit_idxs = np.where(hit_mask)[0]
-
-        # Seed = closest hit
-        i_seed = int(hit_idxs[np.argmin(dists_center[hit_idxs])])
-
-        def prev_i(i): return (i - 1) % N
-        def next_i(i): return (i + 1) % N
-
-        # Expand contiguous cluster on circular ring
-        i_left = i_seed
-        while hit_mask[prev_i(i_left)] and prev_i(i_left) != i_seed:
-            i_left = prev_i(i_left)
-
-        i_right = i_seed
-        while hit_mask[next_i(i_right)] and next_i(i_right) != i_seed:
-            i_right = next_i(i_right)
-
-        # If every ray hits, you don't really have a meaningful "envelope"
-        if np.all(hit_mask):
-            return None
-
-        # Padding beams: one outside cluster on each side
-        pad_left = prev_i(i_left)
-        pad_right = next_i(i_right)
-
-        # Ensure padding beams are actually outside (walk outward if necessary)
-        steps = 0
-        while hit_mask[pad_left] and steps < N:
-            pad_left = prev_i(pad_left)
-            steps += 1
-
-        steps = 0
-        while hit_mask[pad_right] and steps < N:
-            pad_right = next_i(pad_right)
-            steps += 1
-
-        # Boundary angles in robot frame come directly from padded indices
-        ang_L = float(self.lidar_angles[pad_left])
-        ang_R = float(self.lidar_angles[pad_right])
-
-        # Define the cone as the shortest arc from ang_R to ang_L
-        dtheta = float(np.arctan2(np.sin(ang_L - ang_R), np.cos(ang_L - ang_R)))
-        half = 0.5 * abs(dtheta)
-        center = float(np.arctan2(np.sin(ang_R + 0.5 * dtheta), np.cos(ang_R + 0.5 * dtheta)))
-
-        obs_dist = float(dists_center[i_seed])
-        clearance = float(obs_dist - float(self.robot_radius))
-
-        return center, half, obs_dist, clearance
-
-        
-
-
-    def visualize_robot_circle(
-        self,
-        radius: float | None = None,
-        *,
-        z: float | None = None,
-        num_segments: int = 48,
-        color=(0.0, 1.0, 1.0),
-        line_width: float = 2.0,
-        life_time: float = 0.0,
-        clear_previous: bool = True,
-    ):
-        """
-        Draw a circle around the robot center in the XY plane for debugging.
-
-        Assumes:
-        - self.render_mode exists (truthy when GUI/debug drawing is desired)
-        - self._last_env_ob contains robot pose like your other debug functions
-        - optional: self.robot_radius (used if radius is None)
-
-        Parameters:
-        radius: Circle radius in meters. Defaults to self.robot_radius if available, else 0.25.
-        z: Height to draw the circle at. Defaults to self.lidar_height if available, else robot base z.
-        num_segments: Polyline resolution.
-        color: RGB tuple/list in [0,1].
-        line_width: Debug line width.
-        life_time: 0.0 = persistent (until removed), >0 seconds = auto-expire.
-        clear_previous: If True, removes previously drawn circle segments first.
-        """
-        if not getattr(self, "render_mode", False):
-            return
-        if getattr(self, "_last_env_ob", None) is None:
-            return
-
-        # --- Clear prior circle lines
-        if clear_previous:
-            for lid in getattr(self, "_robot_circle_dbg_line_ids", []):
-                try:
-                    p.removeUserDebugItem(lid)
-                except Exception:
-                    pass
-            self._robot_circle_dbg_line_ids = []
-
-        base_state = self._last_env_ob[0]["robot_0"]["joint_state"]
-        pos = base_state["position"]
-        cx, cy = float(pos[0]), float(pos[1])
-        base_z = float(pos[2]) if len(pos) > 2 else 0.0
-
-        if radius is None:
-            radius = float(getattr(self, "robot_radius", 0.25))
-
-        if z is None:
-            # Prefer lidar height (consistent with your other debug visuals), else base_z
-            z = float(getattr(self, "lidar_height", base_z))
-
-        n = max(8, int(num_segments))
-        two_pi = 2.0 * np.pi
-
-        # Build and draw polyline circle
-        line_ids = getattr(self, "_robot_circle_dbg_line_ids", [])
-        for i in range(n):
-            a0 = two_pi * (i / n)
-            a1 = two_pi * ((i + 1) / n)
-
-            p0 = [cx + radius * float(np.cos(a0)), cy + radius * float(np.sin(a0)), z]
-            p1 = [cx + radius * float(np.cos(a1)), cy + radius * float(np.sin(a1)), z]
-
-            lid = p.addUserDebugLine(
-                p0, p1,
-                lineColorRGB=list(color),
-                lineWidth=float(line_width),
-                lifeTime=float(life_time),
-            )
-            line_ids.append(lid)
-
-        self._robot_circle_dbg_line_ids = line_ids
-
-
-
-
-    # ---------------------------------------------------------------------
+    # --------------------------------------------------------------------
     #                         OBSERVATION BUFFER
     # ---------------------------------------------------------------------
     def _get_obs(self):
@@ -423,21 +250,45 @@ class AlbertTableEnv(LidarMixin, gym.Env):
             hcos, hsin,
             Fh_x, Fh_y,
         ], dtype=np.float32)
-
-        if self.use_lidar:
-            # use cached lidar; if not available, fill with "no hit"
-            if self._last_lidar is None:
-                lidar = np.ones(self.lidar_num_rays, dtype=np.float32)
-            else:
-                lidar = self._last_lidar.astype(np.float32)
-            return np.concatenate([obs_core, lidar], axis=0)
-
         return obs_core
 
-  
+    def _obstacle_in_contact(self) -> bool:
+        """
+        True if the ROBOT base is in contact with any obstacle.
+        """
+        if (not self.use_obstacles) or (len(self.obstacle_ids) == 0):
+            return False
+
+        for obs_id in self.obstacle_ids:
+            if p.getContactPoints(bodyA=self.sim.albert_id, bodyB=obs_id):
+                return True
+
+        return False
+
+    def _min_obstacle_distance(self) -> float:
+        """
+        Returns minimum separation distance (meters) between ROBOT base and any obstacle.
+        If nothing is within query distance, returns +inf.
+        """
+        if (not self.use_obstacles) or (len(self.obstacle_ids) == 0):
+            return float("inf")
+
+        d_query = float(max(self.obs_query_dist, self.obs_d_enter + 0.5))
+        min_d = float("inf")
+
+        for obs_id in self.obstacle_ids:
+            pts = p.getClosestPoints(bodyA=self.sim.albert_id, bodyB=obs_id, distance=d_query)
+            for cp in pts:
+                # cp[8] is distance
+                min_d = min(min_d, float(cp[8]))
+
+        return min_d
+   
+    
     # ---------------------------------------------------------------------
     #                            REWARD
     # ---------------------------------------------------------------------
+
     def compute_reward(self, dist, prev_dist, heading_error_bi):
         """
         Computes the shaping reward based on:
@@ -450,8 +301,8 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         """
 
         # progress reward (positive if distance shrinks)
-        kpr = 6.0 # used to be 6.0
-        progress_reward = kpr * (prev_dist - dist) / 0.01
+        kpr = self.kpr # used to be 6.0 but with division by 0.01
+        progress_reward = kpr * (prev_dist - dist) 
 
         # motion reward (velocity toward goal)
         table_xy, _, tv_xy, _ = self.sim.get_table_state_world()
@@ -463,14 +314,14 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         dir_to_goal /= np.linalg.norm(dir_to_goal) + 1e-6
 
         speed_toward_goal = np.dot(tv_xy, dir_to_goal) # in this reward
-        kmr = 2.0 # used to be 2.0
+        kmr = self.kmr # used to be 2.0
         motion_reward = kmr * speed_toward_goal
 
         # distance penalty for not reaching goal
-        distance_penalty = - dist / 10
+        distance_penalty = - dist / self.dist_div
 
         # heading penalty squared
-        whp = 3.5 # used to be 3.5
+        whp = self.whp # used to be 3.5
         heading_penalty = - (whp * heading_error_bi) ** 2
 
         # ---------------------------------------------------------
@@ -484,25 +335,17 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         
         # USE THE HELPER (Standardize Yaw to World Frame)
         robot_pos = np.array(base_state["position"][:2])
-        obstacle_penalty, is_crash = self._calc_obstacle_penalty(robot_pos)
+        obstacle_penalty, is_crash = self.compute_obstacle_penalty()
 
 
-        # ---------------------------------------------------------
-        # Option 2: BYPASS SHAPING
-        # Reward making obstacle move out of the forward cone when blocked.
-        # ---------------------------------------------------------
-        # ---------------------------------------------------------
-        # LiDAR-based bypass shaping (bidirectional)
-        # ---------------------------------------------------------
 
-        bypass_reward = self._avoidance_shaping()
 
         # final reward
         total_reward = (
             progress_reward +
             motion_reward +
             distance_penalty +
-            heading_penalty + obstacle_penalty + bypass_reward
+            heading_penalty + obstacle_penalty
         )
 
         # if self.step_count % 10 == 0:
@@ -511,134 +354,94 @@ class AlbertTableEnv(LidarMixin, gym.Env):
 
         
 
-        return total_reward, progress_reward, motion_reward, distance_penalty, heading_penalty, obstacle_penalty, bypass_reward, is_crash
+        return total_reward, progress_reward, motion_reward, distance_penalty, heading_penalty, obstacle_penalty, is_crash
     
 
-    def _calc_obstacle_penalty(self, _robot_pos_unused):
+
+
+
+    def compute_obstacle_penalty(self) -> tuple[float, bool]:
         """
-        Calculates static repulsion based purely on LiDAR observation.
-        
-        Args:
-            _robot_pos_unused: Kept for signature compatibility, but ignored.
-            
-        Returns:
-            (float) penalty, (bool) is_crash
+        Robot-only obstacle penalty using PyBullet:
+        1) per-step penalty if robot is in contact with obstacle
+        2) one-time impact penalty when contact starts
+        3) smooth proximity penalty when robot is close
+        4) approach penalty when robot moves closer (within the proximity band)
+
+        Requires:
+        - self.obstacle_ids populated in reset() when obstacles are spawned.
+        - self.obs_* parameters set in __init__.
+
+        Returns
+        -------
+        obstacle_penalty : float
+            Negative (or zero) penalty.
+        is_crash : bool
+            Currently always False (do not terminate on contact for now).
         """
-        # 1. Safety / Initialization Checks
-        if (not getattr(self, "use_lidar", False)) or (self._last_lidar is None):
+        obstacle_penalty = 0.0
+        is_crash = False  # keep False; do not terminate on contact for now
+
+        # No obstacles -> no penalty; also reset memory to avoid stale deltas
+        if (not self.use_obstacles) or (len(getattr(self, "obstacle_ids", [])) == 0):
+            # print("no obstacles")
+            self.prev_contact = False
+            self.prev_d_obs = None
             return 0.0, False
 
-        # 2. Get the closest object detected by any ray
-        # self._last_lidar values are in [0, 1], representing [0, max_range]
-        raw_min_norm = np.min(self._last_lidar)
-        
-        # If the closest ray is at max range (approx 1.0), we are safe.
-        if raw_min_norm >= 0.999:
-            return 0.0, False
+        # --------------------------
+        # (1) Contact / impact penalty (robot-only)
+        # --------------------------
+        contact_now = False
+        for obs_id in self.obstacle_ids:
+            if p.getContactPoints(bodyA=self.sim.albert_id, bodyB=obs_id):
+                contact_now = True
+                break
 
-        # 3. Convert to Real Meters
-        # geometric distance from Lidar center to hit point
-        dist_to_hit = raw_min_norm * float(self.lidar_range)
-        
-        # 4. Calculate Skin-to-Skin Clearance
-        # We subtract the robot radius to get the distance from the robot's "skin"
-        clearance = dist_to_hit - float(self.robot_radius)
+        if contact_now:
+            obstacle_penalty -= float(self.obs_contact_penalty)
 
-        # -------------------------------
-        # TUNING PARAMETERS
-        # -------------------------------
-        CRASH_DIST = 0.0   # Meters. Closer than this = 'Crash' zone. Also tried 0.2 larger crash_dist did not seem to matter or robot, but need to connect this with lidar andactual distance
-        SAFE_DIST  = 0.2   # Meters. The "uncomfortable" zone.
-        
-        # Penalties
-        P_CRASH    = -5.0  # Heavy constant penalty for touching # was 7.0
-        K_STATIC   = 5.0    # Scaling factor for the approach (shaping)
+        # one-time impact penalty on contact start
+        if contact_now and (not getattr(self, "prev_contact", False)):
+            obstacle_penalty -= float(self.obs_impact_penalty)
 
-        # 5. Check Crash Zone (The "Hot Stove")
-        # We return is_crash=False so the episode continues, allowing the agent
-        # to learn how to back away from the penalty source.
-        if clearance <= CRASH_DIST:
-            print(f"[CRASH], clearance: {clearance}")
-            return P_CRASH, False 
-        
-        #if self.step_count % 10 == 0:
-            #print("clearance in obstacle penalty", clearance)
-
-        # Smooth repulsion inside SAFE_DIST (continuous gradient)
-        if clearance < SAFE_DIST:
-            # clearance in (CRASH_DIST, SAFE_DIST)
-            x = (SAFE_DIST - clearance) / max(SAFE_DIST - CRASH_DIST, 1e-6)  # 0..1
-            penalty = -K_STATIC * (x ** 2)   # quadratic ramp
-            return float(penalty), False
-        
-        return 0.0, False
-    
-    def _avoidance_shaping(self) -> float:
-        if (not getattr(self, "use_lidar", False)) or (self._last_lidar is None):
-            return 0.0
-
-        v = float(self.last_action_executed[0]) if hasattr(self, "last_action_executed") else 0.0
-        if abs(v) < float(self.escape_v_min):
-            return 0.0
-
-        envelope = self._get_obstacle_envelope_rf()
-        if envelope is None:
-            return 0.0
-
-        cone_center_rf, cone_half_rf, obs_dist, clearance = envelope
-        travel_rf = 0.0 if v >= 0.0 else float(np.pi)
-
-        # if self.step_count % 10 == 0:
-        #     print("clearance in avoidance shaping", clearance)
-
+        self.prev_contact = contact_now
 
         # --------------------------
-        # NO inflation: use raw LiDAR cone half-angle
+        # (2) Smooth proximity + approach penalty (robot-only)
         # --------------------------
-        half = float(cone_half_rf)
+        d_query = float(max(self.obs_query_dist, self.obs_d_enter + 0.5))
+        d_obs = float("inf")
 
-        # Angular difference to cone center
-        delta = float(np.arctan2(np.sin(travel_rf - cone_center_rf), np.cos(travel_rf - cone_center_rf)))
-        ad = abs(delta)
+        for obs_id in self.obstacle_ids:
+            pts = p.getClosestPoints(bodyA=self.sim.albert_id, bodyB=obs_id, distance=d_query)
+            for cp in pts:
+                d_obs = min(d_obs, float(cp[8]))  # cp[8] is distance
 
-        # Proximity scaling (skin-to-skin) -- unchanged
-        d_enter = float(getattr(self, "lidar_block_dist", 2.0))
-        d_safe  = float(getattr(self, "lidar_clear_margin", 0.20))
-        prox = (d_enter - float(clearance)) / max(d_enter - d_safe, 1e-6)
-        prox = float(np.clip(prox, 0.0, 1.0))
+        if np.isfinite(d_obs):
+            d_enter = float(self.obs_d_enter)
+            d_safe = float(self.obs_d_safe)
 
-        if prox <= 0.0:
-            return 0.0
+            # proximity shaping inside the band
+            if d_obs < d_enter:
+                x = (d_enter - d_obs) / max(d_enter - d_safe, 1e-6)
+                x = float(np.clip(x, 0.0, 1.0))
+                obstacle_penalty -= float(self.obs_prox_k) * (x ** 2)
 
-        # Bonus band outside the cone (default 30 degrees)
-        bonus_band = float(getattr(self, "avoid_bonus_band", np.deg2rad(30.0)))
+            # approach penalty (only when within band)
+            prev_d = getattr(self, "prev_d_obs", None)
+            if (prev_d is not None) and (d_obs < d_enter):
+                dd = d_obs - float(prev_d)  # <0 means moving closer
+                obstacle_penalty -= float(self.obs_approach_k) * max(0.0, -dd)
 
-        inside_cone = (ad <= half)
-        in_bonus_band = (ad > half) and (ad <= (half + bonus_band))
-
-        k_in  = 6.0 # 6.0 # also tried 10, 3
-        k_out = 2.0 # also tried 3 see 1111
-
-        # How far past the cone boundary we are (0 at boundary, 1 at outer edge of bonus band)
-        outside_depth = (ad - half) / max(bonus_band, 1e-6)
-        outside_depth = float(np.clip(outside_depth, 0.0, 1.0))
-
-        # Optional shaping curve: emphasize steering further away from boundary
-        outside_gain = outside_depth   # or keep linear: outside_gain = outside_depth
-
-
-        if inside_cone:
-            #print(f"inside cone penalty: {-k_in * (prox ** 2)}")
-            return -k_in * (prox ** 2)
-        elif in_bonus_band:
-            #print(f"outside cone bonus: {+k_out * ((1.2 - prox))}")
-            return +k_out * ((1.0 - prox)) * outside_gain
+            self.prev_d_obs = d_obs
         else:
-            return 0.0
+            # far away: reset approach memory to avoid big deltas later
+            self.prev_d_obs = None
 
 
-
-
+        #print("obstacle penalty", obstacle_penalty)
+        return float(obstacle_penalty), bool(is_crash)
 
 
 
@@ -658,18 +461,17 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         # 0.05 = Robot is heavy but responsive
         # 0.20 = Robot is very light
 
-        GAIN_LIN = 0.5 / 40  # (m/s) per Newton
-        GAIN_ANG = 1.0 / 40  # (rad/s) per Newton (approx torque)
+        GAIN_LIN = float(self.adm_gain_lin)
+        GAIN_ANG = float(self.adm_gain_ang)
+        DEADZONE = float(self.adm_deadzone)
 
-        
-        DEADZONE = 1.0   # Newtons (ignore small noise/tremors)
 
         v_sac, w_sac = action
 
         # 1. Check if force is significant
-        f_mag = np.linalg.norm(Fh_world_xy)
-        if f_mag < DEADZONE:
-            return action # No change
+        # f_mag = np.linalg.norm(Fh_world_xy)
+        # if f_mag < DEADZONE:
+        #     return action # No change
 
         # 2. Get Robot Heading
         robot_yaw = self.get_robot_yaw_wf()
@@ -700,8 +502,9 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         w_adm = w_sac - (GAIN_ANG * F_lat)
 
         # 5. Safety Clipping (Optional but recommended)
-        v_adm = np.clip(v_adm, -1.0, 1.0)
-        w_adm = np.clip(w_adm, -1.5, 1.5)
+        v_adm = np.clip(v_adm, -float(self.adm_v_clip), float(self.adm_v_clip))
+        w_adm = np.clip(w_adm, -float(self.adm_w_clip), float(self.adm_w_clip))
+
 
         return np.array([v_adm, w_adm])
 
@@ -733,6 +536,8 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         # 2) ROBOT IMPEDANCE STEP
         # -------------------------------------------------------
         self.sim.impedance_step(self.goal, robot_xy)
+        self.sim.hold_table_hover(z_target=0.10)
+
 
         # -------------------------------------------------------
         # 3) HUMAN INTERACTION
@@ -762,6 +567,9 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         # -------------------------------------------------------
         Fh_current = self.sim.last_Fh_xy
         action_admitted = self.apply_human_feedback(action, Fh_current)
+        # if self.step_count % 50 ==0: 
+        #     print("human force", Fh_current)
+        #     print("action_admitted", action_admitted)
         v_final, w_final = action_admitted
 
         #w_final = 0.1
@@ -780,11 +588,6 @@ class AlbertTableEnv(LidarMixin, gym.Env):
 
         self.sim.enforce_rigid_arm()
 
-        
-        # Update sensing caches here (one scan per step)
-        self._update_lidar_caches()
-
-
         # Build obs once and return it
         obs = self._get_obs()        
 
@@ -801,7 +604,7 @@ class AlbertTableEnv(LidarMixin, gym.Env):
 
 
 
-        reward, progress_reward, motion_reward, distance_penalty, heading_penalty, obstacle_penalty, bypass_reward, is_crash = (
+        reward, progress_reward, motion_reward, distance_penalty, heading_penalty, obstacle_penalty, is_crash = (
             self.compute_reward(dist, self.prev_dist, heading_error_bi)
         )
 
@@ -811,10 +614,11 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         # -------------------------------------------------------
         # 6) TERMINATION & TRUNCATION
         # -------------------------------------------------------
-        terminated = dist < 0.4
+        terminated = dist < float(self.goal_threshold)
         if terminated:
             print(f"[CHECK] Reached goal at step: {self.step_count}")
-            reward += 150
+            reward += float(self.goal_bonus)
+
 
         if is_crash:
             print(f"[COLLISION] Hit obstacle at step: {self.step_count}")
@@ -840,20 +644,16 @@ class AlbertTableEnv(LidarMixin, gym.Env):
             "obstacle_penalty": obstacle_penalty,
             "heading_penalty": heading_penalty,
             "human_action": self.sim.human_action,
-            "bypass_reward": bypass_reward,
         }
 
-        if self.render and (self.step_count % 75) == 0: 
-            self.visualize_avoid_envelope()
-            self.visualize_robot_circle()
-            #self.visualize_lidar()
-            #print(self._last_lidar * self.lidar_range)
+
 
 
         
 
 
         return obs, reward, terminated, truncated, info
+
 
 
 
@@ -893,7 +693,6 @@ class AlbertTableEnv(LidarMixin, gym.Env):
 
             # 5) Set arm pose (correct frames)
             self.sim.set_arm_initial_pose()
-            #self.sim.disable_arm_motors()
 
             # 6) Save observation (list-format)
             self._last_env_ob = ob0 
@@ -904,11 +703,13 @@ class AlbertTableEnv(LidarMixin, gym.Env):
             if self.use_obstacles:
                 mm = MapMaker()
                 mm.create_map_1()  # Spawns the wall
+                self.obstacle_ids = list(mm.obstacles)  # <-- THIS LINE
 
                 if len(mm.obstacles) > 0:
                     obs_id = mm.obstacles[-1]
                     pos, _ = p.getBasePositionAndOrientation(obs_id)
                     self.obstacle_pos = np.array(pos[:2], dtype=np.float32)
+                    
 
                     aabb_min, aabb_max = p.getAABB(obs_id)
                     size = np.array(aabb_max) - np.array(aabb_min)
@@ -928,14 +729,12 @@ class AlbertTableEnv(LidarMixin, gym.Env):
             # -----------------------------
             # Reset robot base
             # -----------------------------
-            
             p.resetBasePositionAndOrientation(
                 self.sim.albert_id,
-                [0.0, 0.0, 0.2],
+                [0.0, 0.0, 0.1],
                 p.getQuaternionFromEuler([0,0,0])
             )
             p.resetBaseVelocity(self.sim.albert_id, [0,0,0],[0,0,0])
-
 
             # Reset wheels
             for wheel_joint in ["wheel_left_joint", "wheel_right_joint"]:
@@ -945,13 +744,7 @@ class AlbertTableEnv(LidarMixin, gym.Env):
             # -----------------------------
             # Reset table base
             # -----------------------------
-            self.sim.reset_table()   # SAFE: table_id guaranteed to exist
-         
-            # # -----------------------------
-            # # Resolve any collisions
-            # # -----------------------------
-            # for _ in range(5):
-            #     p.stepSimulation()
+            self.sim.reset_table() 
 
             # -----------------------------
             # Fresh URDFenv observation
@@ -960,50 +753,38 @@ class AlbertTableEnv(LidarMixin, gym.Env):
             self._last_env_ob = [raw]
 
         # ===================================================
-        # COMMON SETTLE STEPS FOR BOTH CASES
+        # COMMON SETTLE STEPS (Fixes Rest Length)
         # ===================================================
+        # We step physics BEFORE creating the connection.
+        # We lock XY but allow Z (falling) to ensure it hits the floor perfectly.
+
+        zero = np.zeros(self.sim.env.n(), dtype=float)
+        for _ in range(100):
+            self.sim.hold_table_hover(z_target=0.10)
+            self.sim.enforce_rigid_arm()
+            self._last_env_ob = self.sim.env.step(zero)
 
 
         # ===================================================
-        # 🔗 CREATE CONNECTION (The New Step)
+        # 🔗 CREATE CONNECTION (Measured on settled bodies)
         # ===================================================
-    
+        # Now that velocity is 0 and objects are on the floor, measure.
+
+        p.resetBaseVelocity(self.sim.albert_id, [0,0,0], [0,0,0])
+        p.resetBaseVelocity(self.sim.table_id, [0,0,0], [0,0,0])
         
         self.sim.create_connection_impedance()
 
-        # Impedance settle step
-        base_state = self._last_env_ob[0]["robot_0"]["joint_state"]
-        robot_xy = np.array(base_state["position"][:2])
-        self.sim.impedance_step(self.goal, robot_xy)
-
-        # URDFenv settle
+        # Update observation based on new settled position
         zero = np.zeros(self.sim.env.n())
         self._last_env_ob = self.sim.env.step(zero)
 
-        # Initialize previous distance
+        # Initialize diagnostics
         table_xy, _, _, _ = self.sim.get_table_state_world()
         self.prev_dist = float(np.linalg.norm(self.goal - table_xy))
-
-        # Allow everything to settle 
-        print("allow everything to settle")
-        for _ in range(100):
-            p.stepSimulation()
-            time.sleep(0.01)
-
-        self.prev_obs_dist_surface = None
-        self.prev_obs_bearing = None
-
-        if self.use_lidar:
-            self.lidar_ignore_ids = {self.sim.albert_id, self.sim.table_id}
-
-
-        # Initialize last_action_executed so motion clearance is well-defined
         self.last_action_executed = np.array([0.0, 0.0], dtype=np.float32)
 
-        # Compute first scan caches, then return observation
-        self._update_lidar_caches()
         obs = self._get_obs()
-
         return obs, {}
 
 
@@ -1042,3 +823,4 @@ class AlbertTableEnv(LidarMixin, gym.Env):
         self.sim.env.close()
         print("Environment closed.")
 
+    

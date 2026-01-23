@@ -50,7 +50,6 @@ class RewardLoggerCallback(BaseCallback):
                 "distance_penalty", 
                 "heading_penalty", 
                 "obstacle_penalty",
-                "bypass_reward",
             ]
             
             for key in keys_to_log:
@@ -102,7 +101,6 @@ def train_sac(
             "distance_penalty",
             "heading_penalty",
             "obstacle_penalty", 
-            "bypass_reward",
         )
     )
 
@@ -159,17 +157,64 @@ if __name__ == "__main__":
         warnings.filterwarnings("ignore")
     
     # === ORIGINAL VARIABLE NAMES PRESERVED EXACTLY ===
-    model_name = "9_jan_test"
-    base_log_dir = "runs/offline/jan/runs_9_jan_test"
+    model_name = "experiment_16_jan_80000_"
+    base_log_dir = "runs/offline/jan/runs_21_jan_test"
     render = False
-    use_obstacles=True
+    use_obstacles=False
 
     # === ORIGINAL GOAL LIST ===
-    goal_list = [(0.0, 5.0)]
+    # goal_list = [
+    # # -----------------------
+    # # Near ring (~1.5 m)
+    # # -----------------------
+    # (0.0, 1.5),    # +Y
+    # (1.5, 0.0),    # +X
+    # (0.0, -1.5),   # -Y
+    # (-1.5, 0.0),   # -X
+    # (1.06, 1.06),   # NE
+    # (-1.06, 1.06),  # NW
+    # (-1.06, -1.06), # SW
+    # (1.06, -1.06),  # SE
+
+    # # -----------------------
+    # # Mid ring (~2.5 m)
+    # # -----------------------
+    # (0.0, 2.5),
+    # (2.5, 0.0),
+    # (0.0, -2.5),
+    # (-2.5, 0.0),
+    # (1.77, 1.77),
+    # (-1.77, 1.77),
+    # (-1.77, -1.77),
+    # (1.77, -1.77),
+
+    # # -----------------------
+    # # Far ring (~3.5 m)
+    # # -----------------------
+    # (0.0, 3.5),
+    # (3.5, 0.0),
+    # (0.0, -3.5),
+    # (-3.5, 0.0),
+    # (2.47, 2.47),
+    # (-2.47, 2.47),
+    # (-2.47, -2.47),
+    # (2.47, -2.47),
+# ]
+    goal_list = [
+    (0.0,  2.5),    # N
+    (1.8,  1.8),    # NE
+    (2.5,  0.0),    # E
+    (1.8, -1.8),    # SE
+    (0.0, -3.0),    # S
+    (-1.8, -1.8),   # SW
+    (-2.5,  0.0),   # W
+    (-1.8,  1.8),   # NW
+]
+
 
     # === ORIGINAL TRAINING CALL EXACTLY REPRODUCED ===
     model = train_sac(
-        total_timesteps=100000,
+        total_timesteps=80000,
         goals=goal_list,
         model_name=model_name,
         base_log_dir=base_log_dir,

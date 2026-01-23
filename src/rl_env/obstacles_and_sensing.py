@@ -498,7 +498,7 @@ class MapMaker:
         Creates Map 1: A single gray wall back of the robot.
         """
         self.add_box(
-            pos=(0.0, 2.5, 0.1), 
-            size=(0.5, 0.5, 1.0), 
+            pos=(0.0, 2.0, 0.1), 
+            size=(0.5, 0.1, 2.0), 
             rgba=(0.3, 0.3, 0.3, 1.0) # Gray
         )

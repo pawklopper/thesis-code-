@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 # ✅ Import the modular environment
 from rl_env.albert_table_env import AlbertTableEnv
 
+from controllers.Camercontroller import CameraController
+
 
 def plot_human_reference_trajectory(human):
     handle = np.array(human.traj_handle)
@@ -113,9 +115,11 @@ def run_trained_model_conditional_reset(
     goal = np.array(start_goal)
     goal_marker = draw_goal_marker(goal, color=(1, 0, 0, 1))
     goal_id = 1
-
+    cam = CameraController(target=(0, 0, 0.3))
+    
     try:
         while total_steps < max_runtime_steps:
+            #cam.update()
             # Predict next action
             action, _ = model.predict(obs, deterministic=True)
 
@@ -175,44 +179,14 @@ def run_trained_model_conditional_reset(
 if __name__ == "__main__":
 
 
-    # shows some positivity however, drives as long as it can towards the obstacle, This policy drives around the obstacle, different reward, the one on git
-    # base_log_dir = "runs/offline/jan/runs_2_jan_test"
-    # model_name = "2_jan_test"
-    # run_subdir = "20260102-161938_2_jan_test" 
-    # use_obstacles = True
-
-    #shows some positivity however, drives as long as it can towards the obstacle, This policy drives around the obstacle
-    # base_log_dir = "runs/offline/jan/runs_3_jan_test"
-    # model_name = "3_jan_test"
-    # run_subdir = "20260106-155356_3_jan_test"
-    # use_obstacles = True
-
-    # base_log_dir = "runs/offline/jan/runs_3_jan_test"
-    # model_name = "3_jan_test"
-    # run_subdir = "20260106-175230_3_jan_test"
-    # use_obstacles = True
-
-    # base_log_dir = "runs/offline/jan/runs_7_jan_test"
-    # model_name = "7_jan_test"
-    # run_subdir = 
-    # use_obstacles = True
-
-
-    #show this one tomorrow finished after 1250 steps
-    # base_log_dir = "runs/offline/jan/runs_8_jan_test"
-    # model_name = "8_jan_test"
-    # run_subdir = "20260108-164046_8_jan_test"
-    # use_obstacles = True
-
-
-    base_log_dir = "runs/offline/jan/runs_9_jan_test"
-    model_name = "9_jan_test"
-    run_subdir = "20260109-102447_9_jan_test"
-    use_obstacles = True
+    base_log_dir = "runs/offline/jan/runs_21_jan_test"
+    model_name = "experiment_21_jan_80000"
+    run_subdir = "20260121-155654_experiment_21_jan_80000"
+    use_obstacles = False
 
 
 
-    start_goal = (0.0, 5.0)
+    start_goal = (0.0, 4.0)
 
     print(f"Running trained SAC policy from: {run_subdir}")
     print(f"Start goal: {start_goal}")

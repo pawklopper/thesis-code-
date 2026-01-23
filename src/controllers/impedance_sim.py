@@ -52,14 +52,6 @@ class AlbertTableImpedanceSim:
 
         self.imp_max_force = 1000.0 # used to be 40
 
-        # self.imp_stiffness = 300.0 # used to be 300
-        
-        # # Damping (Kd): How much it resists velocity differences (N/(m/s))
-        # self.imp_damping = 60 # used to be 60
-        
-        
-        # # Saturation: Max force allowed to prevent explosions (N)
-        # self.imp_max_force = 40.0 # used to be 40
 
         # -------------------------------------------------------------------
         # 4. STATE VARIABLES
@@ -83,6 +75,16 @@ class AlbertTableImpedanceSim:
         # The vector for the rigid connection (Robot Local Frame)
         # Created in create_connection_impedance()
         self.rest_vector_local = None 
+
+
+        # -------------------------------------------------------------------
+        # 3b. ROTATIONAL (YAW) IMPEDANCE TUNING
+        # -------------------------------------------------------------------
+        self.rot_stiffness = 300.0   # N*m/rad  (start small; increase carefully)
+        self.rot_damping   = 2.0 * np.sqrt(self.rot_stiffness)  # N*m/(rad/s)
+        self.rot_max_torque = 60.0   # N*m (saturation)
+        self.yaw_rest_offset = None  # stored at connection creation
+
 
 
     # -----------------------------------------------------------------------
@@ -137,7 +139,7 @@ class AlbertTableImpedanceSim:
 
         self.table_id = p.loadURDF(
             table_path,
-            basePosition=[0.0, -1.15, 0.8],
+            basePosition=[0.0, -1.15, 0.1],
             baseOrientation=table_orn,
             useFixedBase=False,
         )
@@ -173,9 +175,6 @@ class AlbertTableImpedanceSim:
                 get_table_state_func=self.get_table_state_world,
             )
 
-        for _ in range(100):
-            p.stepSimulation()
-            time.sleep(0.01)
 
     # -----------------------------------------------------------------------
     #              ROBOT ARM SETUP
@@ -239,7 +238,7 @@ class AlbertTableImpedanceSim:
         raise ValueError(f"Joint '{joint_name}' not found in body {body_id}")
 
     def reset_table(self):
-        start_pos = [0.0, -1.15, 0.5]
+        start_pos = [0.0, -1.15, 0.2]
         start_orn = p.getQuaternionFromEuler([0, 0, -np.pi/2])
         p.resetBasePositionAndOrientation(self.table_id, start_pos, start_orn)
         p.resetBaseVelocity(self.table_id, [0,0,0], [0,0,0])
@@ -250,37 +249,64 @@ class AlbertTableImpedanceSim:
 
     def create_connection_impedance(self):
         """
-        Setup: Measures the initial 'Rest Length' (Y-distance) of the spring 
-        between the Robot EE and the Table Handle in the Robot's frame
+        Setup: Measures the initial 'Rest Length' (local_y) of the spring between the
+        Robot EE and the Table robot-handle, expressed in the Robot's base frame.
+
+        This version is instrumented to show EXACTLY what is changing episode-to-episode:
+        - robot/table base pose (xy, yaw)
+        - EE and handle world poses
+        - world_vec (handle - EE)
+        - local_x/local_y projection (the stored spring rest length)
+        - base linear/angular velocities at measurement time
+
+        It also stores a snapshot in `self._last_connection_debug` for later inspection.
         """
+
         if self.albert_id is None or self.table_id is None:
             return
 
-        # 1. Clean up old constraints
-        if hasattr(self, 'cid') and self.cid is not None:
+        # Clean up old constraint (if you ever add one later)
+        if hasattr(self, "cid") and self.cid is not None:
             p.removeConstraint(self.cid)
             self.cid = None
 
-        # 2. Get current positions
-        ee_pos = np.array(p.getLinkState(self.albert_id, self.ee_idx)[0])
-        h_pos = np.array(p.getLinkState(self.table_id, self.goal_link_idx)[0])
-        
-        # 3. Get Robot Yaw
-        _, robot_orn = p.getBasePositionAndOrientation(self.albert_id)
-        robot_yaw = p.getEulerFromQuaternion(robot_orn)[2]
+        # ---------------------------
+        # Read world states (poses)
+        # ---------------------------
+        ee_pos = np.array(p.getLinkState(self.albert_id, self.ee_idx)[0], dtype=float)
+        h_pos  = np.array(p.getLinkState(self.table_id, self.goal_link_idx)[0], dtype=float)
 
-        # 4. Calculate Vector in Robot's Local Frame
-        world_vec = h_pos - ee_pos
+        rpos, rorn = p.getBasePositionAndOrientation(self.albert_id)
+        tpos, torn = p.getBasePositionAndOrientation(self.table_id)
+
+        robot_yaw = float(p.getEulerFromQuaternion(rorn)[2])
+        table_yaw = float(p.getEulerFromQuaternion(torn)[2])
+
+        # velocities (often the smoking gun)
+        r_lin, r_ang = p.getBaseVelocity(self.albert_id)
+        t_lin, t_ang = p.getBaseVelocity(self.table_id)
+
+        # ---------------------------
+        # Compute projected "rest length" in robot frame
+        # ---------------------------
+        world_vec = (h_pos - ee_pos)  # (dx, dy, dz) in world frame
+
         c, s = np.cos(robot_yaw), np.sin(robot_yaw)
-        
-        # Rotate World -> Local
-        # local_y is the natural forward/backward distance
-        local_y = -s * world_vec[0] + c * world_vec[1]
-        
-        # 5. STORE THE REST LENGTH
-        self.spring_rest_length = local_y
-        
-        print(f"🔗 Connection Created. Spring Rest Length: {self.spring_rest_length:.3f}m")
+
+        # Robot-local coordinates of the handle relative to EE
+        local_x =  c * world_vec[0] + s * world_vec[1]   # lateral
+        local_y = -s * world_vec[0] + c * world_vec[1]   # longitudinal (your "spring length")
+
+        # Store rest length
+        self.spring_rest_length = float(local_y)
+
+        # ---------------------------
+        # Store rest yaw offset (table relative to robot)
+        # ---------------------------
+        self.yaw_rest_offset = wrap_angle(table_yaw - robot_yaw)
+
+        #print(f"spring zero length: {self.spring_rest_length:3f} m | spring zero rotational: {self.yaw_rest_offset:.3f} rad")
+
 
     def impedance_step(self, goal_xy=None, robot_xy=None):
         """
@@ -365,15 +391,46 @@ class AlbertTableImpedanceSim:
         if force_mag > self.imp_max_force:
             force_on_table = force_on_table * (self.imp_max_force / force_mag)
 
+
+        # --- TABLE YAW + RELATIVE YAW RATE ---
+        _, table_orn = p.getBasePositionAndOrientation(self.table_id)
+        table_yaw = p.getEulerFromQuaternion(table_orn)[2]
+
+        # angular velocities (world frame); we only use z
+        _, robot_ang_vel = p.getBaseVelocity(self.albert_id)
+        _, table_ang_vel = p.getBaseVelocity(self.table_id)
+        rel_wz = float(table_ang_vel[2] - robot_ang_vel[2])
+
+        # --- YAW ERROR relative to rest offset ---
+        if self.yaw_rest_offset is None:
+            self.yaw_rest_offset = wrap_angle(table_yaw - robot_yaw)
+
+        yaw_err = wrap_angle((table_yaw - robot_yaw) - self.yaw_rest_offset)
+
+        # torsional spring-damper
+        tau_z = -(self.rot_stiffness * yaw_err + self.rot_damping * rel_wz)
+
+        # saturation
+        tau_z = float(np.clip(tau_z, -self.rot_max_torque, self.rot_max_torque))
+
+
         # 6. Apply Forces
         p.applyExternalForce(self.table_id, self.goal_link_idx, force_on_table, h_pos, p.WORLD_FRAME)
         p.applyExternalForce(self.albert_id, self.ee_idx, -force_on_table, ee_pos, p.WORLD_FRAME)
+
+        # Apply equal and opposite yaw torques (rotational coupling)
+        p.applyExternalTorque(self.table_id, -1, [0.0, 0.0, tau_z], flags=p.WORLD_FRAME)
+        p.applyExternalTorque(self.albert_id, -1, [0.0, 0.0, -tau_z], flags=p.WORLD_FRAME)
+
 
         # 7. Diagnostics
         self.last_F_xy = force_on_table[:2]
         self.last_dx_xy = np.array([x_error, y_error])
 
         #self.debug_impedance_viz()
+
+
+        
         
         return self.last_F_xy, self.last_dx_xy, h_pos[:2], h_vel[:2]
     
@@ -425,4 +482,34 @@ class AlbertTableImpedanceSim:
         # RED: The Spring Deformation (Ideal Point -> Real Handle)
         # This is the visual representation of the Force
         p.addUserDebugLine(ideal_pos, h_pos, [1, 0, 0], lineWidth=4, lifeTime=0.1)
+
+
+    def hold_table_hover(self, z_target: float = 0.10):
+        """
+        Hard-hold the table at z_target and keep it flat:
+        - roll = 0
+        - pitch = 0
+        - yaw is preserved
+        Also kills vertical velocity and roll/pitch angular velocity.
+        """
+        pos, orn = p.getBasePositionAndOrientation(self.table_id)
+        lin_vel, ang_vel = p.getBaseVelocity(self.table_id)
+
+        # Extract current yaw, discard roll/pitch
+        roll, pitch, yaw = p.getEulerFromQuaternion(orn)
+
+        # Force flat orientation (roll=pitch=0), keep yaw
+        flat_orn = p.getQuaternionFromEuler([0.0, 0.0, yaw])
+
+        # Clamp Z, keep XY
+        new_pos = [pos[0], pos[1], z_target]
+        p.resetBasePositionAndOrientation(self.table_id, new_pos, flat_orn)
+
+        # Preserve XY linear velocity and yaw rate; kill vz, wx, wy
+        p.resetBaseVelocity(
+            self.table_id,
+            linearVelocity=[lin_vel[0], lin_vel[1], 0.0],
+            angularVelocity=[0.0, 0.0, ang_vel[2]],
+        )
+
         

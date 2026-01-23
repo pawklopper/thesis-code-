@@ -106,7 +106,7 @@
      2. A wheel joint (Y-axis, with trail offset) -->
 
 <!-- FRONT LEFT -->
-<link name="caster_fl_swivel_link">
+<!-- <link name="caster_fl_swivel_link">
   <inertial><origin xyz="0 0 0"/><mass value="0.05"/><inertia ixx="1e-4" iyy="1e-4" izz="1e-4"/></inertial>
 </link>
 
@@ -137,11 +137,11 @@
   <origin xyz="-0.05 0 -0.06" rpy="0 0 0"/>
   <axis xyz="0 1 0"/>
   <dynamics damping="0.01"/>
-</joint>
+</joint> -->
 
 
 <!-- FRONT RIGHT -->
-<link name="caster_fr_swivel_link">
+<!-- <link name="caster_fr_swivel_link">
   <inertial><origin xyz="0 0 0"/><mass value="0.05"/><inertia ixx="1e-4" iyy="1e-4" izz="1e-4"/></inertial>
 </link>
 
@@ -172,11 +172,11 @@
   <origin xyz="-0.05 0 -0.06" rpy="0 0 0"/>
   <axis xyz="0 1 0"/>
   <dynamics damping="0.01"/>
-</joint>
+</joint> -->
 
 
 <!-- REAR LEFT -->
-<link name="caster_rl_swivel_link">
+<!-- <link name="caster_rl_swivel_link">
   <inertial><origin xyz="0 0 0"/><mass value="0.05"/><inertia ixx="1e-4" iyy="1e-4" izz="1e-4"/></inertial>
 </link>
 
@@ -207,11 +207,11 @@
   <origin xyz="-0.05 0 -0.06" rpy="0 0 0"/>
   <axis xyz="0 1 0"/>
   <dynamics damping="0.01"/>
-</joint>
+</joint> -->
 
 
 <!-- REAR RIGHT -->
-<link name="caster_rr_swivel_link">
+<!-- <link name="caster_rr_swivel_link">
   <inertial><origin xyz="0 0 0"/><mass value="0.05"/><inertia ixx="1e-4" iyy="1e-4" izz="1e-4"/></inertial>
 </link>
 
@@ -242,7 +242,7 @@
   <origin xyz="-0.05 0 -0.06" rpy="0 0 0"/>
   <axis xyz="0 1 0"/>
   <dynamics damping="0.01"/>
-</joint>
+</joint> -->
 
 
 
