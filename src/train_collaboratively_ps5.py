@@ -115,7 +115,7 @@ def cue_goal_reached(
     marker_success_color=(0.1, 0.95, 0.2, 0.95),
     zone_success_outer_color=(0.1, 0.95, 0.2, 0.28),
     zone_success_inner_color=(0.0, 0.0, 0.0, 0.0),
-    show_text=True,
+    show_text=False,
     text="GOAL REACHED — RESETTING",
     text_height=0.35,
     text_color=(0.1, 0.95, 0.2),
@@ -263,7 +263,7 @@ def run_interactive_model(
     # --------------------------------------------------------
     # Paths
     # --------------------------------------------------------
-    offline_dir = os.path.join("runs", "offline", "jan",base_dir, load_run_subdir)
+    offline_dir = os.path.join("runs", "experiment", "basic_training_offline", load_run_subdir)
     pretrained_path = os.path.join(offline_dir, f"{model_name}.zip")
     
     if not os.path.exists(pretrained_path):
@@ -320,6 +320,15 @@ def run_interactive_model(
         "rot_damping": getattr(env.sim, "rot_damping", None),
         "rot_max_torque": getattr(env.sim, "rot_max_torque", None),
     })
+
+    obs, _ = env.reset(Fh_override=np.zeros(3))
+    p.resetDebugVisualizerCamera(
+        cameraDistance=6.0,
+        cameraYaw=0.0,
+        cameraPitch=-89.0,
+        cameraTargetPosition=[0.0, 0.0, 0.0],
+    )
+
 
 
     # --------------------------------------------------------
@@ -443,21 +452,21 @@ def run_interactive_model(
 
             # record variables
             wall_time = time.time()
-            step_rec = build_step_record(
-                env=env,
-                episode_id=episode_id,
-                t_in_episode=t_in_episode,
-                global_step=total_steps,
-                wall_time=wall_time,
-                prev_obs=prev_obs,
-                obs=obs,
-                action_raw=np.array(action, dtype=np.float32),
-                reward=rew,
-                terminated=terminated,
-                truncated=truncated,
-                info=info,
-            )
-            step_logger.add(step_rec)
+            # step_rec = build_step_record(
+            #     env=env,
+            #     episode_id=episode_id,
+            #     t_in_episode=t_in_episode,
+            #     global_step=total_steps,
+            #     wall_time=wall_time,
+            #     prev_obs=prev_obs,
+            #     obs=obs,
+            #     action_raw=np.array(action, dtype=np.float32),
+            #     reward=rew,
+            #     terminated=terminated,
+            #     truncated=truncated,
+            #     info=info,
+            # )
+            # step_logger.add(step_rec)
             t_in_episode += 1
             timer_win.update()
 
@@ -670,9 +679,9 @@ def run_interactive_model(
 # ============================================================
 
 if __name__ == "__main__":
-    base_dir = "runs_14_jan_test"
-    load_run_subdir = "20260114-171544_14_jan_longrun_600000_steps" # Update this to your latest run!
-    model_name = "14_jan_longrun_600000_steps"
+    base_dir = "runs_14_jan_test" # does not matter anymore
+    load_run_subdir = "20260121-155654_experiment_21_jan_80000" # Update this to your latest run!
+    model_name = "experiment_21_jan_80000"
     use_obstacles = True
 
     run_interactive_model(
@@ -680,8 +689,8 @@ if __name__ == "__main__":
         load_run_subdir=load_run_subdir,
         model_name=model_name,
         single_goal_mode=True,
-        start_goal=(0.0, 4.0),
+        start_goal=(-5.0, -0.8),
         max_runtime_steps=100_000,
-        warmup_steps=1002,
+        warmup_steps=0,
         use_obstacles=use_obstacles
     )

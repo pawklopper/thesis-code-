@@ -151,9 +151,9 @@ class AlbertTableEnv(gym.Env):
         self.obs_query_dist = 3.0  # getClosestPoints query radius (>= obs_d_enter)
 
         # Penalty magnitudes
-        self.obs_contact_penalty = 5.0   # per-step penalty when in contact
+        self.obs_contact_penalty = 5.0   # per-step penalty when in contact, used to be 5.
         self.obs_impact_penalty  = 0.0   # one-time penalty when contact starts
-        self.obs_prox_k          = 3.0    # proximity penalty scale (quadratic)
+        self.obs_prox_k          = 5.0    # proximity penalty scale (quadratic)
         self.obs_approach_k      = 0.0    # penalize moving closer (delta distance)
 
         # Memory for penalties
@@ -165,12 +165,12 @@ class AlbertTableEnv(gym.Env):
         # --------------------------
         self.kpr = 600.0     # progress reward gain
         self.kmr = 2.0       # motion reward gain
-        self.whp = 3.5       # heading penalty gain
+        self.whp = 1.5 #3.5  # heading penalty gain
         self.dist_div = 10.0 # distance penalty divisor
 
         # Termination / success shaping (loggable)
         self.goal_threshold = 0.4
-        self.goal_bonus = 100.0
+        self.goal_bonus = 500.0
 
         # --------------------------
         # Admittance hyperparameters (loggable)
@@ -180,6 +180,20 @@ class AlbertTableEnv(gym.Env):
         self.adm_deadzone = 1.0  # N (currently unused in code)
         self.adm_v_clip = 1.0
         self.adm_w_clip = 1.5
+
+        # --------------------------
+        # Table obstacle penalties (NEW; same logic as robot)
+        # --------------------------
+        self.table_obs_d_enter = self.obs_d_enter
+        self.table_obs_d_safe  = self.obs_d_safe
+        self.table_obs_query_dist = self.obs_query_dist
+
+        self.table_obs_contact_penalty =  self.obs_contact_penalty
+        self.table_obs_impact_penalty  = self.obs_impact_penalty
+        self.table_obs_prox_k          = self.obs_prox_k
+
+        self.prev_contact_table = False
+        self.prev_d_obs_table = None
 
 
 
@@ -335,8 +349,11 @@ class AlbertTableEnv(gym.Env):
         
         # USE THE HELPER (Standardize Yaw to World Frame)
         robot_pos = np.array(base_state["position"][:2])
-        obstacle_penalty, is_crash = self.compute_obstacle_penalty()
+        obstacle_penalty_robot, is_crash = self.compute_obstacle_penalty_robot()
+        obstacle_penalty_table, is_crash = self.compute_obstacle_penalty_table()
 
+        obstacle_penalty = (obstacle_penalty_table + obstacle_penalty_robot) 
+        #obstacle_penalty = obstacle_penalty_robot
 
 
 
@@ -360,7 +377,7 @@ class AlbertTableEnv(gym.Env):
 
 
 
-    def compute_obstacle_penalty(self) -> tuple[float, bool]:
+    def compute_obstacle_penalty_robot(self) -> tuple[float, bool]:
         """
         Robot-only obstacle penalty using PyBullet:
         1) per-step penalty if robot is in contact with obstacle
@@ -399,6 +416,7 @@ class AlbertTableEnv(gym.Env):
                 break
 
         if contact_now:
+            print("contact now, hit obstacle")
             obstacle_penalty -= float(self.obs_contact_penalty)
 
         # one-time impact penalty on contact start
@@ -428,11 +446,11 @@ class AlbertTableEnv(gym.Env):
                 x = float(np.clip(x, 0.0, 1.0))
                 obstacle_penalty -= float(self.obs_prox_k) * (x ** 2)
 
-            # approach penalty (only when within band)
-            prev_d = getattr(self, "prev_d_obs", None)
-            if (prev_d is not None) and (d_obs < d_enter):
-                dd = d_obs - float(prev_d)  # <0 means moving closer
-                obstacle_penalty -= float(self.obs_approach_k) * max(0.0, -dd)
+            # # approach penalty (only when within band)
+            # prev_d = getattr(self, "prev_d_obs", None)
+            # if (prev_d is not None) and (d_obs < d_enter):
+            #     dd = d_obs - float(prev_d)  # <0 means moving closer
+            #     obstacle_penalty -= float(self.obs_approach_k) * max(0.0, -dd)
 
             self.prev_d_obs = d_obs
         else:
@@ -442,6 +460,75 @@ class AlbertTableEnv(gym.Env):
 
         #print("obstacle penalty", obstacle_penalty)
         return float(obstacle_penalty), bool(is_crash)
+    
+
+    def compute_obstacle_penalty_table(self) -> tuple[float, bool]:
+        """
+        Table-only obstacle penalty using PyBullet:
+        1) per-step penalty if table is in contact with obstacle
+        2) one-time impact penalty when contact starts
+        3) smooth proximity penalty when table is close
+
+        Returns
+        -------
+        obstacle_penalty : float
+            Negative (or zero) penalty.
+        is_crash : bool
+            Currently always False (do not terminate on contact for now).
+        """
+        obstacle_penalty = 0.0
+        is_crash = False
+
+        if (not self.use_obstacles) or (len(getattr(self, "obstacle_ids", [])) == 0):
+            self.prev_contact_table = False
+            self.prev_d_obs_table = None
+            return 0.0, False
+
+        table_id = getattr(self.sim, "table_id", None)
+        if table_id is None:
+            # If the table isn't loaded yet, avoid penalizing and avoid stale memory.
+            self.prev_contact_table = False
+            self.prev_d_obs_table = None
+            return 0.0, False
+
+        # --------------------------
+        # (1) Contact / impact penalty (table-only)
+        # --------------------------
+        contact_now = False
+        for obs_id in self.obstacle_ids:
+            if p.getContactPoints(bodyA=table_id, bodyB=obs_id):
+                contact_now = True
+                break
+
+        if contact_now:
+            print("contact now, hit obstacle")
+            obstacle_penalty -= float(self.table_obs_contact_penalty)
+
+        if contact_now and (not getattr(self, "prev_contact_table", False)):
+            obstacle_penalty -= float(self.table_obs_impact_penalty)
+
+        self.prev_contact_table = contact_now
+
+        # --------------------------
+        # (2) Smooth proximity penalty (table-only)
+        # --------------------------
+        d_enter = float(self.table_obs_d_enter)
+        d_safe  = float(self.table_obs_d_safe)
+        d_query = float(max(self.table_obs_query_dist, d_enter + 0.5))
+
+        d_obs = float("inf")
+        for obs_id in self.obstacle_ids:
+            pts = p.getClosestPoints(bodyA=table_id, bodyB=obs_id, distance=d_query)
+            for cp in pts:
+                d_obs = min(d_obs, float(cp[8]))
+
+        if np.isfinite(d_obs) and (d_obs < d_enter):
+            x = (d_enter - d_obs) / max(d_enter - d_safe, 1e-6)
+            x = float(np.clip(x, 0.0, 1.0))
+            obstacle_penalty -= float(self.table_obs_prox_k) * (x ** 2)
+
+        return float(obstacle_penalty), bool(is_crash)
+
 
 
 

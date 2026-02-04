@@ -189,7 +189,7 @@ def cue_goal_reached(
     marker_success_color=(0.1, 0.95, 0.2, 0.95),
     zone_success_outer_color=(0.1, 0.95, 0.2, 0.28),
     zone_success_inner_color=(0.0, 0.0, 0.0, 0.0),
-    show_text=True,
+    show_text=False,
     text="GOAL REACHED — RESETTING",
     text_height=0.35,
     text_color=(0.1, 0.95, 0.2),
@@ -303,8 +303,9 @@ def run_interactive_model(
     # --------------------------------------------------------
     # Attach new environment
     # --------------------------------------------------------
-    env = AlbertTableEnv(render=True, goals=[start_goal], use_obstacles=use_obstacles)
+    env = AlbertTableEnv(render=True, goals=[start_goal], use_obstacles=use_obstacles, max_steps=1500)
     model.set_env(env)
+    MAX_EPISODES = 20 
 
     # --------------------------------------------------------
     # Logger setup
@@ -329,6 +330,9 @@ def run_interactive_model(
     # --------------------------------------------------------
     video_path = os.path.join(online_root, f"{participant_label}.mp4")
     video_log_id = start_pybullet_video_recording(video_path)
+    video_start_wall_time = time.time()
+
+  
 
     # Store run metadata once (after env exists + reset)
     step_logger.write_run_meta({
@@ -345,6 +349,9 @@ def run_interactive_model(
         "rot_stiffness": getattr(env.sim, "rot_stiffness", None),
         "rot_damping": getattr(env.sim, "rot_damping", None),
         "rot_max_torque": getattr(env.sim, "rot_max_torque", None),
+        "video_start_wall_time": video_start_wall_time,
+        "video_path": video_path, 
+        "video_log_id": video_log_id
     })
 
     # --------------------------------------------------------
@@ -357,7 +364,7 @@ def run_interactive_model(
         cameraTargetPosition=[0.0, 0.0, 0.0],
     )
 
-    HUD_ENABLED = True
+    HUD_ENABLED = None
     HUD_TARGET = (0.0, 0.0, 0.0)  # must match cameraTargetPosition
     hud_id = None
 
@@ -379,7 +386,7 @@ def run_interactive_model(
     goal = np.array(env.goal if hasattr(env, "goal") else env.goals[0], dtype=np.float32)
 
     GOAL_RECT_CFG = dict(
-        rect_size_xy=(3.0, 2.5),
+        rect_size_xy=(2.5, 3.0),
         rect_thickness=0.01,
         rect_z=0.005,
         rect_color=(1.0, 0.2, 0.2, 0.9),
@@ -452,14 +459,14 @@ def run_interactive_model(
             action, _ = model.predict(obs, deterministic=False)
 
             # --- Human force (ROS /sigma7/wrench -> robot frame) ---
-            Fx_r = HUMAN_FORCE_SIGN * float(_latest_fx)
-            Fy_r = HUMAN_FORCE_SIGN * float(_latest_fy)
+            Fx_sig = HUMAN_FORCE_SIGN * float(_latest_fx)
+            Fy_sig= HUMAN_FORCE_SIGN * float(_latest_fy)
 
             # --- Map robot -> simulation ---
             # robot x -> sim -y
             # robot y -> sim  x
-            Fx =  Fy_r
-            Fy = -Fx_r
+            Fx =  Fy_sig
+            Fy = -Fx_sig
 
             # Clip
             mag = float(np.hypot(Fx, Fy))
@@ -487,6 +494,7 @@ def run_interactive_model(
             head_window.append(info.get("heading_penalty", 0.0))
             eff_window.append(info.get("collaboration_reward", 0.0))
             obstacle_window.append(info.get("obstacle_penalty", 0.0))
+
             reward_window.append(rew)
 
             # --- Add transition to replay buffer ---
@@ -503,9 +511,11 @@ def run_interactive_model(
             # Training Logic
             # -------------------------------------------------------
             if model.replay_buffer.size() > warmup_steps:
-                TRAIN_FREQ = 10
+                TRAIN_FREQ = 1
+                GRADIENT_STEPS = 1   
+                BATCH_SIZE = 32
                 if total_steps % TRAIN_FREQ == 0:
-                    model.train(batch_size=64, gradient_steps=TRAIN_FREQ)
+                    model.train(batch_size=BATCH_SIZE, gradient_steps=GRADIENT_STEPS)
                     for k, v in model.logger.name_to_value.items():
                         if k == "train/actor_loss":
                             actor_loss_window.append(v)
@@ -572,10 +582,10 @@ def run_interactive_model(
                 reset_reason = "truncated"
                 should_reset = True
 
-            elif steps_since_goal >= 1000:
-                print(f"Timeout: resetting SAME goal #{goal_id}")
-                reset_reason = "timeout"
-                should_reset = True
+            # elif steps_since_goal >= 1000:
+            #     print(f"Timeout: resetting SAME goal #{goal_id}")
+            #     reset_reason = "timeout"
+            #     should_reset = True
 
             # record variables (reset_reason is correct for this step)
             wall_time = time.time()
@@ -630,6 +640,11 @@ def run_interactive_model(
 
                 episode_id += 1
                 t_in_episode = 0
+
+                if episode_id >= MAX_EPISODES:
+                    print(f"[STOP] Reached {MAX_EPISODES} episodes (0..{MAX_EPISODES-1}). Exiting loop.")
+                    break
+
 
                 Fr = env.sim.last_F_xy if hasattr(env.sim, "last_F_xy") else np.zeros(2)
                 Fh_debug = env.sim.last_Fh_xy if hasattr(env.sim, "last_Fh_xy") else np.zeros(2)
@@ -734,12 +749,21 @@ def run_interactive_model(
                 time.sleep(sleep_time)
 
     finally:
+        # 0) Save model first, before any PyBullet/Env teardown
+        try:
+            final_zip = os.path.join(online_root, f"{model_name}_final.zip")
+            model.save(final_zip)
+            print(f"[FINAL SAVE] {final_zip}")
+        except Exception as e:
+            print(f"[FINAL SAVE] Failed to save model: {e}")
+
+        # 1) Flush/close logger
         try:
             step_logger.close()
         except Exception as e:
             print(f"[LOGGER] Failed to close parquet logger cleanly: {e}")
 
-        # Stop video recording BEFORE env.close() (env.close may disconnect PyBullet)
+        # 2) Stop video logging (guarded)
         try:
             if video_log_id is not None:
                 info = p.getConnectionInfo()
@@ -751,21 +775,20 @@ def run_interactive_model(
         except Exception as e:
             print(f"[VIDEO] Failed to stop recording cleanly: {e}")
 
+        # 3) Close env (must be guarded!)
+        try:
+            env.close()
+        except Exception as e:
+            print(f"[ENV] Failed to close env cleanly: {e}")
 
-        env.close()
+        # 4) Close timer window
         try:
             timer_win.close()
         except Exception:
             pass
 
-        final_zip = os.path.join(online_root, f"{model_name}_final.zip")
-        final_buffer = os.path.join(online_root, f"{model_name}_final_buffer.pkl")
-
-        model.save(final_zip)
-
-        print(f"[FINAL SAVE] {final_zip}")
-        print(f"[BUFFER SAVED] {final_buffer}")
         print(f"[TB LOGDIR]  {tb_dir}")
+
 
 
 # ============================================================
@@ -773,11 +796,11 @@ def run_interactive_model(
 # ============================================================
 
 if __name__ == "__main__":
-    base_dir = "runs_14_jan_test" # does not matter anymore
-    load_run_subdir = "20260121-155654_experiment_21_jan_80000"
-    model_name = "experiment_21_jan_80000"
+    base_dir = "" # does not matter anymore
+    load_run_subdir = "20260128-145329_experiment_28_jan_20000"
+    model_name = "experiment_28_jan_20000"
     use_obstacles = True
-    participant_label = "Participant_Myself_2"
+    participant_label = "Participant_A_Dimi"
 
     run_interactive_model(
         base_dir=base_dir,
@@ -785,7 +808,7 @@ if __name__ == "__main__":
         model_name=model_name,
         single_goal_mode=True, 
         participant_label=participant_label,
-        start_goal=(0.0, 4.0),
+        start_goal=(-5.0, 0.0),
         max_runtime_steps=100_000,
         warmup_steps=0,
         use_obstacles=use_obstacles
