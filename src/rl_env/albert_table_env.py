@@ -170,7 +170,7 @@ class AlbertTableEnv(gym.Env):
 
         # Termination / success shaping (loggable)
         self.goal_threshold = 0.4
-        self.goal_bonus = 500.0
+        self.goal_bonus = 100.0
 
         # --------------------------
         # Admittance hyperparameters (loggable)

@@ -638,14 +638,6 @@ def run_interactive_model(
             if should_reset:
                 step_logger.flush()
 
-                episode_id += 1
-                t_in_episode = 0
-
-                if episode_id >= MAX_EPISODES:
-                    print(f"[STOP] Reached {MAX_EPISODES} episodes (0..{MAX_EPISODES-1}). Exiting loop.")
-                    break
-
-
                 Fr = env.sim.last_F_xy if hasattr(env.sim, "last_F_xy") else np.zeros(2)
                 Fh_debug = env.sim.last_Fh_xy if hasattr(env.sim, "last_Fh_xy") else np.zeros(2)
                 status = "WARMUP" if total_steps < warmup_steps else "TRAIN"
@@ -687,6 +679,13 @@ def run_interactive_model(
                     ent_coef_loss_window.clear()
                     learning_rate_window.clear()
                     n_updates_window.clear()
+
+                episode_id += 1
+                t_in_episode = 0
+
+                if episode_id >= MAX_EPISODES:
+                    print(f"[STOP] Reached {MAX_EPISODES} episodes (0..{MAX_EPISODES-1}). Exiting loop.")
+                    break
 
                 # -------------------------
                 # Perform Reset (clean)
@@ -800,7 +799,7 @@ if __name__ == "__main__":
     load_run_subdir = "20260128-145329_experiment_28_jan_20000"
     model_name = "experiment_28_jan_20000"
     use_obstacles = True
-    participant_label = "Participant_A_Dimi"
+    participant_label = "Test_for_experiment foto"
 
     run_interactive_model(
         base_dir=base_dir,

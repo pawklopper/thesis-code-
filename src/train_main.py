@@ -214,7 +214,7 @@ if __name__ == "__main__":
 
     # === ORIGINAL TRAINING CALL EXACTLY REPRODUCED ===
     model = train_sac(
-        total_timesteps=1,
+        total_timesteps=20000,
         goals=goal_list,
         model_name=model_name,
         base_log_dir=base_log_dir,
